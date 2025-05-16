@@ -42,8 +42,9 @@ contract VaultManager is ReentrancyGuard {
 
     function burn(uint256 amount) public {
         require(amount > 0, "Amount must be > 0");
-        require((usdToken.balanceOf(msg.sender) >= amount), "Insufficient token balance");
         require(vaults[msg.sender].debtMyUSD >= amount, "Not enough debt");
+        require((usdToken.balanceOf(msg.sender) >= amount), "Insufficient token balance");
+        
    
         usdToken.burn(msg.sender, amount);
         vaults[msg.sender].debtMyUSD -= amount;
