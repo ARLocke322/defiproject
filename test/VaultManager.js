@@ -151,21 +151,102 @@ describe("VaultManager", function () {
     });
 
     describe("Liquidation", function () {
-        it("user should only be able to liquidate undercollateralised vaults", async function () {});
-        it("user should only be able to liquidate vaults that have enough ETH to reward them", async function () {});
-        it("user should not be able to repay 0 tokens", async function () {});
-        it("user should not be able to repay more tokens than are in debt", async function () {});
-        it("user should be able to liquidate undercollateralised vaults", async function () {});
-        it("should emit CollateralLiquidated event", async function () {});
+        it("user should not be able to liquidate overcollateralised vaults", async function () {
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("2000", 18));
+            await expect(
+                vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1000", 18))
+              ).to.be.revertedWith("Vault not undercollateralised");
+
+            
+            // run the liquidation test
+
+        });
+        it("user should not be able to liquidate vaults that do not have enough ETH to reward them", async function () {
+            await vaultManager.test_setVault(user1.address, ethers.parseEther("1"), ethers.parseUnits("3000", 18));
+            await expect(
+                vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("3000", 18))
+              ).to.be.revertedWith("Not enough ETH in vault");
+        });
+        it("user should not be able to repay 0 tokens", async function () {
+            await vaultManager.test_setVault(user1.address, ethers.parseEther("1"), ethers.parseUnits("3000", 18));
+            await expect(
+                vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("0", 18))
+              ).to.be.revertedWith("Amount must be > 0");
+        });
+        it("user should not be able to repay more tokens than are in debt (test path)", async function () {
+            await vaultManager.test_setVault(user1.address, ethers.parseEther("0.25"), ethers.parseUnits("1000", 18));
+            await expect(
+                vaultManager.connect(user2).test_liquidateWithoutRewardCheck(user1.address, ethers.parseUnits("1500", 18))
+              ).to.be.revertedWith("Cannot repay more than debt");
+        });
+        it("user should be able to liquidate undercollateralised vaults", async function () {
+            await vaultManager.connect(user2).depositCollateral({value: ethers.parseEther("2")});
+            await vaultManager.connect(user2).mint(ethers.parseUnits("2000", 18));
+
+            await vaultManager.test_setVault(user1.address, ethers.parseEther("1"), ethers.parseUnits("3000", 18));
+
+            const balanceBefore = await ethers.provider.getBalance(user2.address);
+
+            await usdToken.connect(user2).approve(vaultManager.target, ethers.parseUnits("1500", 18));
+            
+            await vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1500", 18))
+
+            const vault = await vaultManager.getVault(user1.address);
+
+            // check debt gone down
+            const balanceAfter = await ethers.provider.getBalance(user2.address);
+
+            expect(vault.debtMyUSD).to.equal(ethers.parseUnits("1500"));
+
+            // check user2 eth gone up
+            expect(balanceAfter).to.equal(balanceBefore + ethers.parseEther("0.7875"));
+
+           
+            // check user2 tokens gone down
+            expect(await usdToken.balanceOf(user2.address)).to.equal(ethers.parseUnits("500", 18));
+        });
+        it("should emit CollateralLiquidated event", async function () {
+            await vaultManager.connect(user2).depositCollateral({value: ethers.parseEther("2")});
+            await vaultManager.connect(user2).mint(ethers.parseUnits("2000", 18));
+
+            await vaultManager.test_setVault(user1.address, ethers.parseEther("1"), ethers.parseUnits("3000", 18));
+
+            await usdToken.connect(user2).approve(vaultManager.target, ethers.parseUnits("1500", 18));
+
+            await expect(      
+                vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1500", 18))
+              ).to.emit(vaultManager, "CollateralLiquidated")
+                .withArgs(user1.address, user2.address, ethers.parseUnits("1500", 18), ethers.parseEther("0.7875"));
+        });
     });
 
     describe("Get vault", function () {
-        it("user should be able to get the values of a vault", async function () {});
+        it("user should be able to get the values of a vault", async function () {
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("2")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("2000", 18));
+
+            const vault = await vaultManager.getVault(user1.address);
+
+            expect(vault.collateralETH).to.equal(ethers.parseEther("2"));
+            expect(vault.debtMyUSD).to.equal(ethers.parseUnits("2000", 18));
+        });
     });
 
     describe("Get collateral ratio", function () {
-        it("user should be able to get the collateral ratio of a vault", async function () {});
-        it("should return max uint if user has no debt", async function () {});
+        it("user should be able to get the collateral ratio of a vault", async function () {
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("2")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("2000", 18));
+            const collateralRatio = await vaultManager.getCollateralRatio(user1.address);
+
+            expect(collateralRatio).to.equal(ethers.parseUnits("2", 18));
+            
+        });
+        it("should return max uint if user has no debt", async function () {
+            const collateralRatio = await vaultManager.getCollateralRatio(user1.address);
+
+            expect(collateralRatio).to.equal(ethers.MaxUint256);
+        });
 
     });
 });

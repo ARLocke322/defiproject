@@ -93,11 +93,38 @@ contract VaultManager is ReentrancyGuard {
     }       
 
     function getCollateralRatio(address user) external view returns (uint256 ratio) {
+        // returns current collateral ratio of vault
         Vault memory vault = vaults[user];
         if (vault.debtMyUSD == 0) return type(uint256).max;
         uint256 collateralUSD = vault.collateralETH * ethPrice / 1e18;
         return collateralUSD * 1e18 / vault.debtMyUSD;
     }
+// remove before deployment
+    function test_setVault(address user, uint256 collateralETH, uint256 debtMyUSD) external {
+        vaults[user] = Vault(collateralETH, debtMyUSD);
+    }
+
+    function test_liquidateWithoutRewardCheck(address user, uint256 repayAmount) public nonReentrant {
+    // No undercollateralised check here
+        uint256 ethReward = repayAmount * bonusPercent * 1e18 / ethPrice / 100;
+
+        require(((vaults[user].collateralETH * ethPrice / 1e18) < (vaults[user].debtMyUSD * 150 / 100)), "Vault not undercollateralised");
+        // require(ethReward <= vaults[user].collateralETH, "Not enough ETH in vault");
+        require(repayAmount > 0, "Amount must be > 0");
+        require(repayAmount <= vaults[user].debtMyUSD, "Cannot repay more than debt");
+
+        usdToken.transferFrom(msg.sender, address(this), repayAmount);
+    
+        (bool ethTransferSuccess, ) = msg.sender.call{value: ethReward}("");
+        require(ethTransferSuccess, "ETH transfer failed");
+
+        usdToken.burn(address(this), repayAmount);
+        vaults[user].collateralETH -= ethReward;
+        vaults[user].debtMyUSD -= repayAmount;
+        emit CollateralLiquidated(user, msg.sender, repayAmount, ethReward);
+
+    }
+
 
 
 }
