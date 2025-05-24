@@ -20,7 +20,11 @@ describe("VaultManager", function () {
         mockPriceFeed = await MockV3Aggregator.deploy(2000e8); // 8 decimals (e.g. $2000)
 
         const VaultManager = await ethers.getContractFactory("VaultManager");
-        vaultManager = await VaultManager.deploy(usdToken.target, mockPriceFeed.target);
+        vaultManager = await VaultManager.deploy(
+            usdToken.target,
+            mockPriceFeed.target,
+            admin.address // this sets `admin` as the owner
+        );
         await vaultManager.waitForDeployment();
 
         const MINTER_ROLE = await usdToken.MINTER_ROLE();
@@ -194,7 +198,7 @@ describe("VaultManager", function () {
 
                 await usdToken.connect(user2).approve(vaultManager.target, ethers.parseUnits("1500", 18));
 
-                await vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1500", 18))
+                await vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1500", 18));
 
                 const vault = await vaultManager.getVault(user1.address);
 
@@ -370,6 +374,61 @@ describe("VaultManager", function () {
         });
 
     });
+
+    describe("Pausable", function () {
+        it("should allow only owner to pause/unpause", async function() {
+            await vaultManager.connect(admin).pause();
+            await expect(vaultManager.connect(user1).unpause()).to.be.revertedWithCustomError(vaultManager, "OwnableUnauthorizedAccount");
+        });
+        describe("Pausing", function () {
+            it("should block minting when paused", async function() {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("6") });
+                await vaultManager.connect(admin).pause();
+                await expect(vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18))).to.be.revertedWithCustomError(vaultManager, "EnforcedPause");
+            });
+            it("should block burning when paused", async function() {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("6") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+                await vaultManager.connect(admin).pause();
+                await expect(vaultManager.connect(user1).burn(ethers.parseUnits("500", 18))).to.be.revertedWithCustomError(vaultManager, "EnforcedPause");
+            });
+            it("should block deposits when paused", async function() {
+                await vaultManager.connect(admin).pause();
+                await expect(vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("6") })).to.be.revertedWithCustomError(vaultManager, "EnforcedPause");
+            });
+            it("should block withdrawals when paused", async function() {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("6") });
+                await vaultManager.connect(admin).pause();
+                await expect(vaultManager.connect(user1).withdrawCollateral(ethers.parseEther("2"))).to.be.revertedWithCustomError(vaultManager, "EnforcedPause");
+            });
+            it("should block liquidation when paused", async function() {
+                await vaultManager.connect(user2).depositCollateral({ value: ethers.parseEther("2") });
+                await vaultManager.connect(user2).mint(ethers.parseUnits("2000", 18));
+
+                await vaultManager.test_setVault(user1.address, ethers.parseEther("1"), ethers.parseUnits("3000", 18));
+
+                await usdToken.connect(user2).approve(vaultManager.target, ethers.parseUnits("1500", 18));
+
+                await vaultManager.connect(admin).pause();
+                await expect(vaultManager.connect(user2).liquidate(user1.address, ethers.parseUnits("1500", 18))).to.be.revertedWithCustomError(vaultManager, "EnforcedPause");
+            });
+        });
+        describe("Unpausing", function () {
+            it("should allow minting again after unpausing", async function () {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("2") });
+                await vaultManager.connect(admin).pause();
+                await vaultManager.connect(admin).unpause();
+
+                await expect(vaultManager.connect(user1).mint(ethers.parseUnits("500", 18)))
+                    .to.emit(vaultManager, "USDTokenMinted");
+            });
+
+        });
+        
+        
+        
+    });
+
 
 });
     
