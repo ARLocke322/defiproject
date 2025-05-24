@@ -2,8 +2,11 @@ pragma solidity ^0.8.28;
 import { USDToken } from "./USDToken.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract VaultManager is ReentrancyGuard {
+
+contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     struct Vault {
     uint256 collateralETH; // ETH locked by user (in wei)
     uint256 debtMyUSD;     // MyUSD minted by user (18 decimals)
@@ -37,7 +40,7 @@ contract VaultManager is ReentrancyGuard {
 
 
 
-    constructor(address _usdToken, address _priceFeed) {
+    constructor(address _usdToken, address _priceFeed, address _admin) Ownable(_admin) {
         usdToken = USDToken(_usdToken);
         priceFeed = AggregatorV3Interface(_priceFeed);
         priceDecimals = priceFeed.decimals();
@@ -50,12 +53,12 @@ contract VaultManager is ReentrancyGuard {
         return uint256(price);
     }
 
-    function depositCollateral() public payable {
+    function depositCollateral() public payable whenNotPaused {
         vaults[msg.sender].collateralETH += msg.value;
         emit CollateralDeposited(msg.sender, msg.value);
     }
 
-    function mint(uint256 amount) public {
+    function mint(uint256 amount) public whenNotPaused {
         require(amount > 0, "Amount must be > 0");
 
         Vault storage vault = vaults[msg.sender];
@@ -72,7 +75,7 @@ contract VaultManager is ReentrancyGuard {
         emit USDTokenMinted(msg.sender, amount);
     }
 
-    function burn(uint256 amount) public {
+    function burn(uint256 amount) public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         require(amount > 0, "Amount must be > 0");
         require(vault.debtMyUSD >= amount, "Not enough debt");
@@ -84,7 +87,7 @@ contract VaultManager is ReentrancyGuard {
         emit USDTokenBurned(msg.sender, amount);
     }
 
-    function withdrawCollateral(uint256 amount) public nonReentrant {
+    function withdrawCollateral(uint256 amount) public nonReentrant whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         uint256 ethPrice = getLatestPrice();
         require(amount > 0, "Amount must be > 0");
@@ -106,7 +109,7 @@ contract VaultManager is ReentrancyGuard {
         emit CollateralWithdrawn(msg.sender, amount);  
     }
 
-    function liquidate(address user, uint256 repayAmount) public nonReentrant { // repayAmount in USDTKN
+    function liquidate(address user, uint256 repayAmount) public nonReentrant whenNotPaused { // repayAmount in USDTKN
         Vault storage vault = vaults[user];
         uint256 ethPrice = getLatestPrice();
         require(!vault.zeroLiquidation, "Zero Liquidation vault cannot be liquidated");
@@ -147,7 +150,7 @@ contract VaultManager is ReentrancyGuard {
         return collateralUSD * 1e18 / vault.debtMyUSD;
     }
 
-    function enableZeroLiquidation() public {
+    function enableZeroLiquidation() public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         uint256 ethPrice = getLatestPrice();
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
@@ -158,7 +161,7 @@ contract VaultManager is ReentrancyGuard {
         emit ZeroLiquidationEnabled(msg.sender);
     }
 
-    function disableZeroLiquidation() public {
+    function disableZeroLiquidation() public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         uint256 ethPrice = getLatestPrice();
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
@@ -167,6 +170,14 @@ contract VaultManager is ReentrancyGuard {
         require((collateralValue * 1e18) / vault.debtMyUSD >= STANDARD_COLLATERAL_RATIO, "Not enough collateral");
         vault.zeroLiquidation = false;
         emit ZeroLiquidationDisabled(msg.sender);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
    
 
