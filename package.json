@@ -18,9 +18,11 @@
   "homepage": "https://github.com/ARLocke322/defiproject#readme",
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
-    "hardhat": "^2.24.0"
+    "hardhat": "^2.24.0",
+    "solidity-coverage": "^0.8.16"
   },
   "dependencies": {
+    "@chainlink/contracts": "^0.4.0",
     "@openzeppelin/contracts": "^5.3.0"
   }
 }
