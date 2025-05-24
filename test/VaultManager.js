@@ -36,6 +36,11 @@ describe("VaultManager", function () {
     describe("Standard Vaults", function () {
 
         describe("Depositing collateral", function () {
+            it("should not be able to deposit under the collateral floor", async function() {
+                await expect(
+                    vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("0.000001") })
+                ).to.be.revertedWith("Must be above collateral floor");
+            });
             it("user should be able to deposit collateral in ETH", async function () {
                 await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
                 const vault = await vaultManager.getVault(user1.address);
@@ -55,6 +60,12 @@ describe("VaultManager", function () {
                 await expect(
                     vaultManager.connect(user1).withdrawCollateral(ethers.parseEther("0"))
                 ).to.be.revertedWith("Amount must be > 0");
+            });
+            it("should not be able to withdraw under the collateral floor", async function() {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await expect(
+                    vaultManager.connect(user1).withdrawCollateral(ethers.parseEther("0.9999999"))
+                ).to.be.revertedWith("Cannot go below collateral floor");
             });
             it("user should not be able to withdraw more collateral than there is in the vault", async function () {
                 await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
@@ -424,11 +435,69 @@ describe("VaultManager", function () {
             });
 
         });
-        
-        
-        
     });
 
-
+    describe("Setters", function () {
+        describe("Collateral Floor", function () {
+            it("only owner can set", async function () {
+                await expect(
+                    vaultManager.connect(user1).setCollateralFloor(ethers.parseUnits("20", 18))
+                ).to.be.revertedWithCustomError(vaultManager, "OwnableUnauthorizedAccount");
+            });
+            it("owner should be able to set a new floor", async function () {
+                const newFloor = ethers.parseUnits("20", 18);
+                await expect(vaultManager.connect(admin).setCollateralFloor(newFloor))
+                    .to.emit(vaultManager, "CollateralFloorUpdated")
+                    .withArgs(newFloor);
+                expect(await vaultManager.COLLATERAL_FLOOR()).to.equal(newFloor);
+                
+            });
+        });
+        describe("Collateral Ratios", function () {
+            it("standard ratio cannot be < 1", async function () {
+                await expect(
+                    vaultManager.connect(admin).setCollateralRatios(ethers.parseUnits("90", 16), ethers.parseUnits("250", 16))
+                ).to.be.revertedWith("Too low");
+            });
+            it("ZL ratio must be greater than standard", async function () {
+                await expect(
+                    vaultManager.connect(admin).setCollateralRatios(ethers.parseUnits("250", 16), ethers.parseUnits("150", 16))
+                ).to.be.revertedWith("ZL must be stricter");
+            });
+            it("only owner can set", async function () {
+                await expect(
+                    vaultManager.connect(user1).setCollateralRatios(ethers.parseUnits("150", 16), ethers.parseUnits("250", 16))
+                ).to.be.revertedWithCustomError(vaultManager, "OwnableUnauthorizedAccount");
+            });
+            it("owner should be able to set a new collateral ratio", async function () {
+                const newStandardRatio = ethers.parseUnits("150", 16);
+                const newZeroRatio = ethers.parseUnits("250", 16);
+                await expect(vaultManager.connect(admin).setCollateralRatios(newStandardRatio, newZeroRatio))
+                    .to.emit(vaultManager, "CollateralRatiosUpdated")
+                    .withArgs(newStandardRatio, newZeroRatio);
+                expect(await vaultManager.STANDARD_COLLATERAL_RATIO()).to.equal(newStandardRatio);
+                expect(await vaultManager.ZERO_LIQUIDATION_COLLATERAL_RATIO()).to.equal(newZeroRatio);
+            });
+        });
+        describe("Bonus Percent", function () {
+            it("bonus percent must be greater than 100", async function () {
+                await expect(
+                    vaultManager.connect(admin).setBonusPercent(ethers.parseUnits("90", 16))
+                ).to.be.revertedWith("Must be >= 100");
+            });
+            it("only owner can set", async function () {
+                await expect(
+                    vaultManager.connect(user1).setBonusPercent(ethers.parseUnits("110", 16))
+                ).to.be.revertedWithCustomError(vaultManager, "OwnableUnauthorizedAccount");
+            });
+            it("owner should be able to set a new bonus percent", async function () {
+                const newBonus = ethers.parseUnits("110", 16);
+                await expect(vaultManager.connect(admin).setBonusPercent(newBonus))
+                    .to.emit(vaultManager, "BonusPercentUpdated")
+                    .withArgs(newBonus);
+                expect(await vaultManager.BONUS_PERCENT()).to.equal(newBonus);
+            });
+        });
+    });
 });
     

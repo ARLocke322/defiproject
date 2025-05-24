@@ -14,10 +14,12 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     }
 
     AggregatorV3Interface internal priceFeed;
+    uint256 public COLLATERAL_FLOOR = 10e18; // $10 in 18 decimals
+
 
 
     
-    uint256 public constant bonusPercent = 105;
+    uint256 public BONUS_PERCENT = 105e16;
 
     mapping(address => Vault) public vaults;
 
@@ -31,9 +33,13 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     event ZeroLiquidationEnabled(address indexed user);
     event ZeroLiquidationDisabled(address indexed user);
 
+    event CollateralRatiosUpdated(uint256 standard, uint256 zeroLiquidation);
+    event CollateralFloorUpdated(uint256 newFloor);
+    event BonusPercentUpdated(uint256 newBonus);
+
     USDToken public immutable usdToken;
-    uint256 public constant STANDARD_COLLATERAL_RATIO = 150e16; // 150%
-    uint256 public constant ZERO_LIQUIDATION_COLLATERAL_RATIO = 250e16; // 250%
+    uint256 public STANDARD_COLLATERAL_RATIO = 150e16; // 150%
+    uint256 public ZERO_LIQUIDATION_COLLATERAL_RATIO = 250e16; // 250%
 
     uint8 public priceDecimals;
 
@@ -53,8 +59,39 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         return uint256(price);
     }
 
+    function isAboveCollateralFloor(uint256 ethAmount) public view returns (bool) {
+        if (ethAmount == 0) {
+            return true;
+        }
+        uint256 ethPrice = getLatestPrice(); // 8 decimals
+        uint256 collateralUSD = ethAmount * ethPrice / 1e8;
+        return collateralUSD >= COLLATERAL_FLOOR;
+    }
+
+    function setCollateralFloor(uint256 newFloor) external onlyOwner { 
+        COLLATERAL_FLOOR = newFloor;
+        emit CollateralFloorUpdated(newFloor);
+    }
+
+    function setCollateralRatios(uint256 _standard, uint256 _zero) external onlyOwner {
+        require(_standard >= 1e18, "Too low");
+        require(_zero >= _standard, "ZL must be stricter");
+        STANDARD_COLLATERAL_RATIO = _standard;
+        ZERO_LIQUIDATION_COLLATERAL_RATIO = _zero;
+        emit CollateralRatiosUpdated(_standard, _zero);
+    }
+
+    function setBonusPercent(uint256 newBonus) external onlyOwner {
+        require(newBonus >= 1e18, "Must be >= 100");
+        BONUS_PERCENT = newBonus;
+        emit BonusPercentUpdated(newBonus);
+    }
+
+
     function depositCollateral() public payable whenNotPaused {
-        vaults[msg.sender].collateralETH += msg.value;
+        Vault storage vault = vaults[msg.sender];
+        require(isAboveCollateralFloor(msg.value + vault.collateralETH), "Must be above collateral floor");
+        vault.collateralETH += msg.value;
         emit CollateralDeposited(msg.sender, msg.value);
     }
 
@@ -90,10 +127,13 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     function withdrawCollateral(uint256 amount) public nonReentrant whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         uint256 ethPrice = getLatestPrice();
+
+        
         require(amount > 0, "Amount must be > 0");
         require(vault.collateralETH >= amount, "Not enough collateral to withdraw");
 
         uint256 newCollateral = vault.collateralETH - amount;
+        require(isAboveCollateralFloor(newCollateral), "Cannot go below collateral floor");
         uint256 newCollateralValue = newCollateral * ethPrice / 10 ** priceDecimals;
         uint256 collateralRatio = vault.zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
         
@@ -114,7 +154,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         uint256 ethPrice = getLatestPrice();
         require(!vault.zeroLiquidation, "Zero Liquidation vault cannot be liquidated");
 
-        uint256 ethReward = repayAmount * bonusPercent * 10 ** priceDecimals / ethPrice / 100;
+        uint256 ethReward = repayAmount * BONUS_PERCENT * 10 ** priceDecimals / ethPrice / 1e18;
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
 
         require(vault.debtMyUSD > 0, "Vault has no debt");
@@ -194,7 +234,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     function test_liquidateWithoutRewardCheck(address user, uint256 repayAmount) public nonReentrant {
     // No undercollateralised check here
         uint256 ethPrice = getLatestPrice();
-        uint256 ethReward = repayAmount * bonusPercent * 10 ** priceDecimals / ethPrice / 100;
+        uint256 ethReward = repayAmount * BONUS_PERCENT * 10 ** priceDecimals / ethPrice / 1e18;
 
         require(((vaults[user].collateralETH * ethPrice / 10 ** priceDecimals) < (vaults[user].debtMyUSD * 150 / 100)), "Vault not undercollateralised");
         // require(ethReward <= vaults[user].collateralETH, "Not enough ETH in vault");
