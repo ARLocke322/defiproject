@@ -4,6 +4,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "prb-math/contracts/PRBMathUD60x18.sol";
 
 
 contract VaultManager is ReentrancyGuard, Ownable, Pausable {
@@ -11,12 +12,15 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     uint256 collateralETH; // ETH locked by user (in wei)
     uint256 debtMyUSD;     // MyUSD minted by user (18 decimals)
     bool zeroLiquidation; // is zero liquidation toggled
+    uint256 lastIndex;
     }
+
+    using PRBMathUD60x18 for uint256;
 
     AggregatorV3Interface internal priceFeed;
     uint256 public COLLATERAL_FLOOR = 10e18; // $10 in 18 decimals
-
-
+    uint256 public constant SECONDS_IN_YEAR = 31536000;
+    uint256 public INTEREST_RATE = 1000000001585489000;
 
     
     uint256 public BONUS_PERCENT = 105e16;
@@ -36,12 +40,16 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     event CollateralRatiosUpdated(uint256 standard, uint256 zeroLiquidation);
     event CollateralFloorUpdated(uint256 newFloor);
     event BonusPercentUpdated(uint256 newBonus);
+    event InterestRateUpdated(uint256 newRate);
 
     USDToken public immutable usdToken;
     uint256 public STANDARD_COLLATERAL_RATIO = 150e16; // 150%
     uint256 public ZERO_LIQUIDATION_COLLATERAL_RATIO = 250e16; // 250%
 
     uint8 public priceDecimals;
+    uint256 public debtIndex = 1e18; // start at 1.0 in fixed point
+    uint256 public lastIndexUpdate; // timestamp of last update
+
 
 
 
@@ -87,6 +95,63 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         emit BonusPercentUpdated(newBonus);
     }
 
+    function setInterestRate(uint256 newRate) external onlyOwner {
+        // interest rate per second
+        require(newRate <= 2e18, "Rate must be <= 2.0");
+        require(newRate >= 1e18, "Rate must be >= 1.0");
+        updateDebtIndex();
+        INTEREST_RATE = newRate;
+        emit InterestRateUpdated(newRate);
+    }
+
+    function updateDebtIndex() public {
+        uint256 timeElapsed = block.timestamp - lastIndexUpdate;
+        if (timeElapsed == 0) return;
+        
+        if (timeElapsed > SECONDS_IN_YEAR) {
+            timeElapsed = SECONDS_IN_YEAR;
+        }
+        debtIndex = debtIndex.mul(PRBMathUD60x18.powu(INTEREST_RATE, timeElapsed));
+        lastIndexUpdate = block.timestamp;
+    }
+
+    function getCurrentIndex() public view returns (uint256) {
+        uint256 timeElapsed = block.timestamp - lastIndexUpdate;
+        if (timeElapsed == 0) return debtIndex;
+        if (timeElapsed > SECONDS_IN_YEAR) {
+            timeElapsed = SECONDS_IN_YEAR;
+        }
+        return debtIndex.mul(PRBMathUD60x18.powu(INTEREST_RATE, timeElapsed));
+    }
+
+    function getUpdatedDebt(address user) public view returns (uint256) {
+        Vault memory vault = vaults[user];
+        if (vault.debtMyUSD == 0) return 0;
+
+        uint256 timeElapsed = block.timestamp - lastIndexUpdate;
+        uint256 currentIndex = debtIndex;
+
+        if (timeElapsed > 0) {
+            currentIndex = currentIndex.mul(PRBMathUD60x18.powu(INTEREST_RATE, timeElapsed));
+        }
+
+        return vault.debtMyUSD.mul(currentIndex).div(vault.lastIndex);
+    }
+
+
+    function _accrueInterest(address user) internal {
+        updateDebtIndex();
+        Vault storage vault = vaults[user];
+        if (vault.debtMyUSD > 0) {
+            vault.debtMyUSD = getUpdatedDebt(user); // updates the actual number
+        }
+        vault.lastIndex = debtIndex; // reset snapshot
+    }
+
+    function getAnnualRate() public view returns (uint256) {
+        return PRBMathUD60x18.powu(INTEREST_RATE, SECONDS_IN_YEAR);
+    }
+
 
     function depositCollateral() public payable whenNotPaused {
         Vault storage vault = vaults[msg.sender];
@@ -99,26 +164,32 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         require(amount > 0, "Amount must be > 0");
 
         Vault storage vault = vaults[msg.sender];
+        
+        _accrueInterest(msg.sender);
+        
+
+
         uint256 ethPrice = getLatestPrice();
         // uint256 collateralValue = vault.collateralETH * ethPrice / 1e18;
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
 
         uint256 newDebt = vault.debtMyUSD + amount;
         uint256 collateralRatio = vault.zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
-        require((collateralValue * 1e18) / newDebt >= collateralRatio, "Not enough collateral"); // Ensure collateral ratio (scaled by 1e18) meets required minimum
+        require((collateralValue * 1e18) / newDebt >= collateralRatio, "Not enough collateral"); 
 
         usdToken.mint(msg.sender, amount);
         vault.debtMyUSD += amount;
+
         emit USDTokenMinted(msg.sender, amount);
     }
 
     function burn(uint256 amount) public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _accrueInterest(msg.sender);
         require(amount > 0, "Amount must be > 0");
         require(vault.debtMyUSD >= amount, "Not enough debt");
         require((usdToken.balanceOf(msg.sender) >= amount), "Insufficient token balance");
-        
-   
+
         usdToken.burn(msg.sender, amount);
         vault.debtMyUSD -= amount;
         emit USDTokenBurned(msg.sender, amount);
@@ -126,6 +197,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function withdrawCollateral(uint256 amount) public nonReentrant whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _accrueInterest(msg.sender);
         uint256 ethPrice = getLatestPrice();
 
         
@@ -176,10 +248,13 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
    
     }
 
-    function getVault(address user) external view returns (uint256 collateralETH, uint256 debtMyUSD, bool zeroLiquidation) {
+    function getVault(address user) external view returns (uint256 collateralETH, uint256 debtMyUSD, bool zeroLiquidation, uint256 lastIndex) {
         Vault memory vault = vaults[user];
-        return (vault.collateralETH, vault.debtMyUSD, vault.zeroLiquidation);
-    }       
+        return (vault.collateralETH, vault.debtMyUSD, vault.zeroLiquidation, vault.lastIndex);
+    }
+
+
+       
 
     function getCollateralRatio(address user) public view returns (uint256 ratio) {
         // returns current collateral ratio of vault
@@ -192,6 +267,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function enableZeroLiquidation() public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _accrueInterest(msg.sender);
         uint256 ethPrice = getLatestPrice();
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
         require(!vault.zeroLiquidation, "Vault already has Zero Liquidation enabled");
@@ -202,8 +278,9 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     }
 
     function disableZeroLiquidation() public whenNotPaused {
-        Vault storage vault = vaults[msg.sender];
-        uint256 ethPrice = getLatestPrice();
+        Vault storage vault = vaults[msg.sender]; // 3 2000 true 1e18
+        _accrueInterest(msg.sender); 
+        uint256 ethPrice = getLatestPrice(); // 2000
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
         require(vault.zeroLiquidation, "Vault does not have Zero Liquidation enabled");
         require(vault.debtMyUSD > 0, "Vault has no debt");
@@ -224,11 +301,11 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
 // remove before deployment
     function test_setVault(address user, uint256 collateralETH, uint256 debtMyUSD) external {
-        vaults[user] = Vault(collateralETH, debtMyUSD, false);
+        vaults[user] = Vault(collateralETH, debtMyUSD, false, debtIndex);
     }
 
     function test_setZLVault(address user, uint256 collateralETH, uint256 debtMyUSD) external {
-        vaults[user] = Vault(collateralETH, debtMyUSD, true);
+        vaults[user] = Vault(collateralETH, debtMyUSD, true, debtIndex);
     }
 
     function test_liquidateWithoutRewardCheck(address user, uint256 repayAmount) public nonReentrant {
@@ -252,7 +329,5 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         emit CollateralLiquidated(user, msg.sender, repayAmount, ethReward);
 
     }
-
-
 
 }

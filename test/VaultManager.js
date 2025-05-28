@@ -32,6 +32,8 @@ describe("VaultManager", function () {
 
         await usdToken.grantRole(MINTER_ROLE, vaultManager.target);
         await usdToken.grantRole(BURNER_ROLE, vaultManager.target);
+
+        await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1", 18));
     });
     describe("Standard Vaults", function () {
 
@@ -366,14 +368,14 @@ describe("VaultManager", function () {
         describe("Disabling ZL", function () {
             it("should revert if collateral ratio is below 150%", async function () {
                 await vaultManager.connect(user1).test_setZLVault(user1.address, ethers.parseEther("3"), ethers.parseUnits("5000", 18))
-
+                
                 await expect(
                     vaultManager.connect(user1).disableZeroLiquidation()
                 ).to.be.revertedWith("Not enough collateral");
             });
             it("should succeed and set zeroLiquidation to false if collateral ratio is 150% or more", async function () {
                 await vaultManager.connect(user1).test_setZLVault(user1.address, ethers.parseEther("3"), ethers.parseUnits("2000", 18))
-
+                
                 await expect(
                     vaultManager.connect(user1).disableZeroLiquidation()
                 ).to.emit(vaultManager, "ZeroLiquidationDisabled")
@@ -498,6 +500,184 @@ describe("VaultManager", function () {
                 expect(await vaultManager.BONUS_PERCENT()).to.equal(newBonus);
             });
         });
+        describe("Interest Rate", function () {
+            it("Interest Rate must be <= 100%", async function () {
+                await expect(
+                    vaultManager.connect(admin).setInterestRate(ethers.parseUnits("3", 18))
+                ).to.be.revertedWith("Rate must be <= 2.0");
+            });
+            it("Interest Rate must be >= 0%", async function () {
+                await expect(
+                    vaultManager.connect(admin).setInterestRate(ethers.parseUnits("0.5", 18))
+                ).to.be.revertedWith("Rate must be >= 1.0");
+            });
+            it("only owner can set", async function () {
+                await expect(
+                    vaultManager.connect(user1).setInterestRate(ethers.parseUnits("1.01", 18))
+                ).to.be.revertedWithCustomError(vaultManager, "OwnableUnauthorizedAccount");
+            });
+            it("owner should be able to set a new Interest Rate", async function () {
+                const newFee = ethers.parseUnits("1.01", 18);
+                await expect(vaultManager.connect(admin).setInterestRate(newFee))
+                    .to.emit(vaultManager, "InterestRateUpdated")
+                    .withArgs(newFee);
+                expect(await vaultManager.INTEREST_RATE()).to.equal(newFee);
+            });
+        });
+
     });
+
+    describe("Interest Rate", function () {
+        let YEAR;
+        beforeEach(async function () {
+            await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1.000000001547125957", 18));
+            YEAR = 31536000
+        });
+  
+        it("should not accrue interest if no time has passed", async function () {
+            // Mint, immediately mint again — debt should remain unchanged
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            const vault = await vaultManager.getVault(user1.address);
+            expect(vault.debtMyUSD).to.be.closeTo(ethers.parseUnits("2000", 18), 2e15);
+
+        });
+      
+        it("should accrue correct interest after 1 year", async function () {
+            // Mint 1000, wait 1 year, expect debt ≈ 1050 
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("1050", 18), 2e15);
+        });
+      
+        it("should accrue interest before minting", async function () {
+            // Mint, wait, mint again — ensure interest applied first
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("2050", 18), 2e15);
+        });
+      
+        it("should accrue interest before burning", async function () {
+            // Mint, wait, burn — check debt reflects interest first
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            await vaultManager.connect(user1).burn(ethers.parseUnits("1000", 18));
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("50", 18), 2e15);
+        });
+      
+        it("should accrue interest before withdrawing collateral", async function () {
+            // Mint, wait, withdraw — ensure interest is considered in checks
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            expect(await vaultManager.connect(user1).withdrawCollateral(ethers.parseEther("1.5"))).to.be.revertedWith("Withdrawing would cause debt to be undercollateralised");
+            
+        });
+      
+        it("should accrue interest before enabling Zero Liquidation", async function () {
+            // Mint, wait, try enabling ZL — debt should reflect interest
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            await vaultManager.connect(user1).enableZeroLiquidation();
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("1050", 18), 2e15);
+        });
+      
+        it("should accrue interest before disabling Zero Liquidation", async function () {
+            // Enable ZL, wait, disable — debt should reflect interest
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+            await vaultManager.connect(user1).enableZeroLiquidation();
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            await vaultManager.connect(user1).disableZeroLiquidation();
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("1050", 18), 2e15);
+        });
+      
+        it("should not accrue interest if debt is 0", async function () {
+            // Deposit collateral but don’t mint — wait, trigger accrue — expect no change
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.equal(ethers.parseUnits("0", 18));
+        });
+      
+        it("should allow fee to be set to 1", async function () {
+            // Set fee to zero, wait, accrue — debt should not change
+            await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1", 18));
+
+            await vaultManager.connect(user1).depositCollateral({value: ethers.parseEther("3")});
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+            
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.equal(ethers.parseUnits("1000", 18), 2e15);
+            
+        });
+
+        it("should accrue correct interest after 2 years", async function () {
+            await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("3") });
+            await vaultManager.connect(user1).mint(ethers.parseUnits("1000", 18));
+        
+            await network.provider.request({
+                method: 'evm_increaseTime',
+                params: [YEAR * 2],
+            });
+            await network.provider.request({ method: 'evm_mine' });
+        
+            const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+            expect(vaultDebt).to.be.closeTo(ethers.parseUnits("1102.5", 18), 2e15);
+        });
+      });
+      
 });
     
