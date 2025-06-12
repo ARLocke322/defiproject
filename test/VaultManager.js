@@ -2,6 +2,7 @@
 const hre = require("hardhat");
 const { ethers } = hre;
 const { expect } = require("chai");
+const { exp } = require("prb-math");
 
 describe("VaultManager", function () {
     let usdToken, vaultManager, admin, user1, user2;
@@ -34,6 +35,7 @@ describe("VaultManager", function () {
         await usdToken.grantRole(BURNER_ROLE, vaultManager.target);
 
         await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1", 18));
+        await vaultManager.connect(admin).setRebalancingEnabled(false);
     });
     describe("Standard Vaults", function () {
 
@@ -679,5 +681,218 @@ describe("VaultManager", function () {
         });
       });
       
+    describe("Rebalancing Logic", function () {
+        
+        const REBALANCE_INTERVAL = 43200; // 12 hours 
+        const YEAR = 31536000
+
+        beforeEach(async function () {
+            await vaultManager.connect(admin).setRebalancingEnabled(true);
+            await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1.000000001547125957", 18));
+        });
+
+        describe("Interval Control", function () {
+            it("should NOT rebalance before REBALANCE_INTERVAL has passed", async function () {
+                const lastRate = await vaultManager.INTEREST_RATE();
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("3") });
+                const newRate = await vaultManager.INTEREST_RATE();
+                expect(newRate).to.equal(lastRate);
+            });
+
+            it("should rebalance AFTER REBALANCE_INTERVAL has passed", async function () {
+                // Simulate enough time passing
+                // Trigger user action and check INTEREST_RATE is updated
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("100") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+                const lastRate = await vaultManager.INTEREST_RATE();
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                // Check event emitted
+                await expect(await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18))).to.emit(vaultManager, "InterestRateUpdated");
+
+                // Check that the rate changed
+                const newRate = await vaultManager.INTEREST_RATE();
+                expect(newRate).to.not.equal(lastRate);
+            });
+        });
+
+        describe("Collateral Ratio Thresholds", function () {
+            it("should set interest rate to 0.296% if CR >= 200%", async function () {
+            // Manipulate ETH collateral and price to simulate CR >= 200%
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("500", 18));
+                
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000000937303470", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.03", 18), ethers.parseUnits("0.0001", 18));
+
+            });
+
+            it("should set interest rate to 0.39% if 180% <= CR < 200%", async function () {
+            // Manipulate to simulate 180% <= CR < 200%
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1050", 18));
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001243680656", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.04", 18), ethers.parseUnits("0.0001", 18));
+            });
+
+            it("should set interest rate to 0.46% if 160% <= CR < 180%", async function () {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1175", 18));
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001395766281", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.045", 18), ethers.parseUnits("0.0001", 18));
+            });
+
+            it("should set interest rate to 0.54% if 140% <= CR < 160%", async function () {
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1300", 18));
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001547125957", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.05", 18), ethers.parseUnits("0.0001", 18));
+            });
+////
+            it("should set interest rate to 0.62% if 120% <= CR < 140%", async function () {
+                await vaultManager.test_setVault(user1, ethers.parseEther("1"), ethers.parseUnits("1538", 18))
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user2).depositCollateral({ value: ethers.parseEther("0.01") })
+                await vaultManager.connect(user2).mint(ethers.parseUnits("10", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001697766583", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.055", 18), ethers.parseUnits("0.0001", 18));
+            });
+
+            it("should set interest rate to 0.70% if 100% <= CR < 120%", async function () {
+                await vaultManager.test_setVault(user1, ethers.parseEther("1"), ethers.parseUnits("1818", 18))
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user2).depositCollateral({ value: ethers.parseEther("0.01") })
+                await vaultManager.connect(user2).mint(ethers.parseUnits("10", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001847694957", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.06", 18), ethers.parseUnits("0.0001", 18));
+            });
+
+            it("should set interest rate to 1.01% if CR < 100%", async function () {
+                await vaultManager.test_setVault(user1, ethers.parseEther("1"), ethers.parseUnits("4000", 18))
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user2).depositCollateral({ value: ethers.parseEther("0.01") })
+                await vaultManager.connect(user2).mint(ethers.parseUnits("10", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000002145441671", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.07", 18), ethers.parseUnits("0.0001", 18));
+            });
+        });
+
+        describe("Correct Interest Application After Rebalancing", function () {
+            it("new interest rate should affect debt growth", async function () {
+            // Rebalance to a higher rate
+            // Wait 1 year and compare calculated vs expected debt
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("3") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("999", 18));
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+                
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [YEAR-REBALANCE_INTERVAL],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+
+                
+                const vaultDebt = await vaultManager.getUpdatedDebt(user1.address);
+                expect(vaultDebt).to.be.closeTo(ethers.parseUnits("1030", 18), 2e15);
+            });
+        });
+
+        describe("Edge Cases", function () {
+            it("should not revert if total debt is 0 (infinite CR)", async function () {
+            // Set totalDebtMyUSD to 0, call rebalance and ensure no revert
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("3") });
+                await expect( // _rebalanceInterestRate called
+                    vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") })
+                ).to.emit(vaultManager, "CollateralDeposited")
+                    .withArgs(user1.address, ethers.parseEther("1"));
+            });
+
+            it("should skip rebalancing if interval not reached", async function () {
+            // Manually check INTEREST_RATE doesn't change
+                await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("1") });
+                await vaultManager.connect(user1).mint(ethers.parseUnits("500", 18));
+
+                await network.provider.request({
+                    method: 'evm_increaseTime',
+                    params: [REBALANCE_INTERVAL/2],
+                });
+                await network.provider.request({ method: 'evm_mine' });
+
+                await vaultManager.connect(user1).mint(ethers.parseUnits("1", 18));
+
+                expect(await vaultManager.INTEREST_RATE()).to.equal(ethers.parseUnits("1.000000001547125957", 18));
+                expect(await vaultManager.getAnnualRate()).to.be.closeTo(ethers.parseUnits("1.05", 18), ethers.parseUnits("0.0001", 18));
+            });
+        });
+    });
 });
     

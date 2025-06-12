@@ -17,10 +17,16 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     using PRBMathUD60x18 for uint256;
 
+    uint256 public totalCollateralETH = 0;
+    uint256 public totalDebtMyUSD = 0;
+
     AggregatorV3Interface internal priceFeed;
     uint256 public COLLATERAL_FLOOR = 10e18; // $10 in 18 decimals
     uint256 public constant SECONDS_IN_YEAR = 31536000;
     uint256 public INTEREST_RATE = 1000000001585489000;
+
+    uint256 public REBALANCE_INTERVAL = 43200; // 12 hours
+    uint256 public lastRebalance = block.timestamp;
 
     
     uint256 public BONUS_PERCENT = 105e16;
@@ -37,6 +43,8 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     event ZeroLiquidationEnabled(address indexed user);
     event ZeroLiquidationDisabled(address indexed user);
 
+    event RebalancingEnabledUpdated(bool enabled);
+
     event CollateralRatiosUpdated(uint256 standard, uint256 zeroLiquidation);
     event CollateralFloorUpdated(uint256 newFloor);
     event BonusPercentUpdated(uint256 newBonus);
@@ -50,6 +58,8 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     uint256 public debtIndex = 1e18; // start at 1.0 in fixed point
     uint256 public lastIndexUpdate; // timestamp of last update
 
+    bool public rebalancingEnabled = true;
+
 
 
 
@@ -58,6 +68,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         usdToken = USDToken(_usdToken);
         priceFeed = AggregatorV3Interface(_priceFeed);
         priceDecimals = priceFeed.decimals();
+        lastIndexUpdate = block.timestamp;
     }
 
 
@@ -103,6 +114,12 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         INTEREST_RATE = newRate;
         emit InterestRateUpdated(newRate);
     }
+
+    function setRebalancingEnabled(bool enabled) external onlyOwner {
+        rebalancingEnabled = enabled;
+        emit RebalancingEnabledUpdated(enabled);
+    }
+
 
     function updateDebtIndex() public {
         uint256 timeElapsed = block.timestamp - lastIndexUpdate;
@@ -153,10 +170,53 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     }
 
 
+    function _rebalanceInterestRate() internal {
+        if (!rebalancingEnabled) return;
+        if (block.timestamp - lastRebalance >= REBALANCE_INTERVAL) {
+            uint256 globalCollateralRatio = calculateGlobalCollateralRatio();
+            uint256 newRate;
+            if (globalCollateralRatio >= 2e18) {
+                newRate = 1000000000937303470;
+            } else if (globalCollateralRatio >= 1.8e18) {
+                newRate = 1000000001243680656;
+            } else if (globalCollateralRatio >= 1.6e18) {
+                newRate = 1000000001395766281;
+            } else if (globalCollateralRatio >= 1.4e18) {
+                newRate = 1000000001547125957;
+            } else if (globalCollateralRatio >= 1.2e18) {
+                newRate = 1000000001697766583;
+            } else if (globalCollateralRatio >= 1e18) {
+                newRate = 1000000001847694957;
+            } else { // < 100
+                newRate = 1000000002145441671;
+            }
+            INTEREST_RATE = newRate;
+            lastRebalance = block.timestamp;
+            emit InterestRateUpdated(newRate);
+        }
+    }
+
+    function calculateGlobalCollateralRatio() public view returns (uint256) {
+        if (totalDebtMyUSD == 0) {
+            return type(uint256).max; // Effectively infinite ratio if no debt exists
+        }
+        uint256 ethPrice = getLatestPrice(); // e.g. 2000 USD with 8 decimals
+        uint256 collateralValueUSD = totalCollateralETH * ethPrice / (10 ** priceDecimals);
+        return collateralValueUSD * 1e18 / totalDebtMyUSD;
+    }
+
+    
+
+
+
+
     function depositCollateral() public payable whenNotPaused {
         Vault storage vault = vaults[msg.sender];
         require(isAboveCollateralFloor(msg.value + vault.collateralETH), "Must be above collateral floor");
+        _rebalanceInterestRate();
+        _accrueInterest(msg.sender);
         vault.collateralETH += msg.value;
+        totalCollateralETH += msg.value;
         emit CollateralDeposited(msg.sender, msg.value);
     }
 
@@ -164,11 +224,9 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         require(amount > 0, "Amount must be > 0");
 
         Vault storage vault = vaults[msg.sender];
-        
+        _rebalanceInterestRate();
         _accrueInterest(msg.sender);
         
-
-
         uint256 ethPrice = getLatestPrice();
         // uint256 collateralValue = vault.collateralETH * ethPrice / 1e18;
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
@@ -179,12 +237,14 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
         usdToken.mint(msg.sender, amount);
         vault.debtMyUSD += amount;
+        totalDebtMyUSD += amount;
 
         emit USDTokenMinted(msg.sender, amount);
     }
 
     function burn(uint256 amount) public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _rebalanceInterestRate();
         _accrueInterest(msg.sender);
         require(amount > 0, "Amount must be > 0");
         require(vault.debtMyUSD >= amount, "Not enough debt");
@@ -192,11 +252,19 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
         usdToken.burn(msg.sender, amount);
         vault.debtMyUSD -= amount;
+        totalDebtMyUSD -= amount;
         emit USDTokenBurned(msg.sender, amount);
     }
 
+    function repayAll() external whenNotPaused {
+        uint256 updatedDebt = getUpdatedDebt(msg.sender);
+        burn(updatedDebt);
+    }
+
+
     function withdrawCollateral(uint256 amount) public nonReentrant whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _rebalanceInterestRate();
         _accrueInterest(msg.sender);
         uint256 ethPrice = getLatestPrice();
 
@@ -214,6 +282,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         }
 
         vault.collateralETH -= amount;
+        totalCollateralETH -= amount;
 
         (bool success, ) = msg.sender.call{value: amount}("");
         require(success, "ETH transfer failed");
@@ -223,6 +292,8 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function liquidate(address user, uint256 repayAmount) public nonReentrant whenNotPaused { // repayAmount in USDTKN
         Vault storage vault = vaults[user];
+        _rebalanceInterestRate();
+        _accrueInterest(user);
         uint256 ethPrice = getLatestPrice();
         require(!vault.zeroLiquidation, "Zero Liquidation vault cannot be liquidated");
 
@@ -242,7 +313,10 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
         usdToken.burn(address(this), repayAmount);
         vault.collateralETH -= ethReward;
+        totalCollateralETH -= ethReward;
+
         vault.debtMyUSD -= repayAmount;
+        totalDebtMyUSD -= repayAmount;
         emit CollateralLiquidated(user, msg.sender, repayAmount, ethReward);
 
    
@@ -267,6 +341,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function enableZeroLiquidation() public whenNotPaused {
         Vault storage vault = vaults[msg.sender];
+        _rebalanceInterestRate();
         _accrueInterest(msg.sender);
         uint256 ethPrice = getLatestPrice();
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
@@ -279,6 +354,7 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function disableZeroLiquidation() public whenNotPaused {
         Vault storage vault = vaults[msg.sender]; // 3 2000 true 1e18
+        _rebalanceInterestRate();
         _accrueInterest(msg.sender); 
         uint256 ethPrice = getLatestPrice(); // 2000
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
@@ -302,6 +378,9 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 // remove before deployment
     function test_setVault(address user, uint256 collateralETH, uint256 debtMyUSD) external {
         vaults[user] = Vault(collateralETH, debtMyUSD, false, debtIndex);
+    
+        totalCollateralETH += collateralETH;
+        totalDebtMyUSD += debtMyUSD;
     }
 
     function test_setZLVault(address user, uint256 collateralETH, uint256 debtMyUSD) external {
