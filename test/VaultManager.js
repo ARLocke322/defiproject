@@ -7,7 +7,7 @@ const { exp } = require("prb-math");
 describe("VaultManager", function () {
     let usdToken, vaultManager, admin, user1, user2;
     beforeEach(async function () {
-        [admin, user1, user2] = await ethers.getSigners();
+        [admin, user1, user2, treasury] = await ethers.getSigners();
 
         const USDToken = await ethers.getContractFactory("USDToken");
         usdToken = await USDToken.deploy(
@@ -24,7 +24,8 @@ describe("VaultManager", function () {
         vaultManager = await VaultManager.deploy(
             usdToken.target,
             mockPriceFeed.target,
-            admin.address // this sets `admin` as the owner
+            admin.address, // this sets `admin` as the owner
+            treasury.address
         );
         await vaultManager.waitForDeployment();
 
@@ -36,6 +37,8 @@ describe("VaultManager", function () {
 
         await vaultManager.connect(admin).setInterestRate(ethers.parseUnits("1", 18));
         await vaultManager.connect(admin).setRebalancingEnabled(false);
+
+        await vaultManager.connect(admin).setMintFee(0);
     });
     describe("Standard Vaults", function () {
 
@@ -894,5 +897,54 @@ describe("VaultManager", function () {
             });
         });
     });
+
+    describe("Minting MyUSD with fees", function () {
+        beforeEach(async function () {
+            await vaultManager.connect(admin).setMintFee(ethers.parseUnits("5", 15)); // 0.5%
+            await vaultManager.connect(user1).depositCollateral({ value: ethers.parseEther("3") });
+        });
+
+        it("should charge a 0.5% fee on mint and increase vault debt accordingly", async function () {
+            const mintAmount = ethers.parseUnits("100", 18);
+            const fee = mintAmount * 5n / 1000n; // 0.5% of 100
+
+            await vaultManager.connect(user1).mint(mintAmount);
+
+            const vault = await vaultManager.getVault(user1.address);
+            expect(vault.debtMyUSD).to.equal(mintAmount + fee);
+        });
+
+        it("should mint the fee amount to the treasury", async function () {
+            const mintAmount = ethers.parseUnits("100", 18);
+            const fee = mintAmount * 5n / 1000n;
+
+            await vaultManager.connect(user1).mint(mintAmount);
+
+            const treasuryBalance = await usdToken.balanceOf(treasury.address);
+            expect(treasuryBalance).to.equal(fee);
+        });
+
+        it("should emit FeeCollected and USDTokenMinted events correctly", async function () {
+            const mintAmount = ethers.parseUnits("100", 18);
+            const fee = mintAmount * 5n / 1000n;
+
+            await expect(vaultManager.connect(user1).mint(mintAmount))
+                .to.emit(vaultManager, "FeeCollected")
+                .withArgs(user1.address, mintAmount, fee);
+
+            await expect(vaultManager.connect(user1).mint(mintAmount))
+                .to.emit(vaultManager, "USDTokenMinted")
+                .withArgs(user1.address, mintAmount);
+        });
+
+        it("should not allow minting if fee causes undercollateralisation", async function () {
+            const mintAmount = ethers.parseUnits("4000", 18); // $80 mint, fee = $0.40 → total = $80.40
+
+            await expect(
+                vaultManager.connect(user1).mint(mintAmount)
+            ).to.be.revertedWith("Not enough collateral");
+        });
+    });
+
 });
     

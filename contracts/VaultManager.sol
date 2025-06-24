@@ -50,6 +50,9 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     event BonusPercentUpdated(uint256 newBonus);
     event InterestRateUpdated(uint256 newRate);
 
+
+    event FeeCollected(address indexed user, uint256 amount, uint256 fee);
+
     USDToken public immutable usdToken;
     uint256 public STANDARD_COLLATERAL_RATIO = 150e16; // 150%
     uint256 public ZERO_LIQUIDATION_COLLATERAL_RATIO = 250e16; // 250%
@@ -60,17 +63,35 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     bool public rebalancingEnabled = true;
 
+    address public treasury;
+    uint256 public mintFee = 5e15; // 0.5%
 
 
 
 
-    constructor(address _usdToken, address _priceFeed, address _admin) Ownable(_admin) {
+
+
+    constructor(address _usdToken, address _priceFeed, address _admin, address _treasury) Ownable(_admin) {
         usdToken = USDToken(_usdToken);
         priceFeed = AggregatorV3Interface(_priceFeed);
         priceDecimals = priceFeed.decimals();
         lastIndexUpdate = block.timestamp;
+        treasury = _treasury;
     }
 
+    function setTreasury(address newTreasury) external onlyOwner {
+        require(newTreasury != address(0), "Invalid address");
+        treasury = newTreasury;
+    }
+
+    function setMintFee(uint256 newFee) external onlyOwner {
+        require(newFee >= 0, "Fee must be >= 0"); 
+        mintFee = newFee;
+    }
+
+    function getMintFee() public view returns (uint256) {
+        return mintFee;
+    }
 
     function getLatestPrice() public view returns (uint256) {
         (, int256 price, , , ) = priceFeed.latestRoundData();
@@ -231,13 +252,20 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
         // uint256 collateralValue = vault.collateralETH * ethPrice / 1e18;
         uint256 collateralValue = vault.collateralETH * ethPrice / 10 ** priceDecimals;
 
-        uint256 newDebt = vault.debtMyUSD + amount;
+        uint256 fee = amount * mintFee / 1e18;
+
+        uint256 newDebt = vault.debtMyUSD + amount + fee;
         uint256 collateralRatio = vault.zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
         require((collateralValue * 1e18) / newDebt >= collateralRatio, "Not enough collateral"); 
 
+        
         usdToken.mint(msg.sender, amount);
-        vault.debtMyUSD += amount;
-        totalDebtMyUSD += amount;
+        usdToken.mint(treasury, fee);
+
+        vault.debtMyUSD = vault.debtMyUSD + amount + fee;
+        totalDebtMyUSD = totalDebtMyUSD + amount + fee;
+
+        emit FeeCollected(msg.sender, amount, fee);
 
         emit USDTokenMinted(msg.sender, amount);
     }
