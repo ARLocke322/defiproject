@@ -8,28 +8,34 @@ import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
 import { AlertTriangle, TrendingUp, Clock, Shield, Wallet, Plus, Minus, RefreshCw, DollarSign, Zap, Loader2 } from 'lucide-react'
 
+import { toast } from "sonner";
 import { useVaultManager } from "../context/VaultManagerContext";
 import { ethers } from "ethers";
 
-// Mock data - in a real app, this would come from blockchain/API
-const mockData = {
-    walletAddress: "0x742d35Cc6634C0532925a3b8D4C9db4C4C4C4C4C",
-    collateralETH: "2.5",
-    debtMyUSD: "3,250",
-    collateralRatio: 185,
-    liquidationRisk: "Medium",
-    ethPrice: "2,450.32",
-    interestRate: "3.2",
-    timeUntilRebalance: "2h 34m",
-    liquidationPrice: "1,950.00",
-    safetyBuffer: 15.2,
-    requiredRatio: 150,
-    currentRatio: 185,
-    maxMintable: "1,250",
-    ethBalance: "5.2",
-    myUSDBalance: "850",
-    accruedInterest: "12.45",
-}
+
+// Helper function to convert risk level to string
+const getRiskLevelString = (riskLevel: number): string => {
+    switch (riskLevel) {
+        case 0: return "Low";
+        case 1: return "Medium";
+        case 2: return "High";
+        case 3: return "Critical";
+        default: return "Unknown";
+    }
+};
+
+// Helper function to format time until rebalance
+const formatTimeUntilRebalance = (seconds: number): string => {
+    if (seconds === 0) return "Ready";
+
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+
+    if (hours > 0) {
+        return `${hours}h ${minutes}m`;
+    }
+    return `${minutes}m`;
+};
 
 const liquidationData = [
     {
@@ -92,16 +98,464 @@ export default function VaultDashboard() {
     const [walletAddress, setWalletAddress] = useState("")
     const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
-    // 2. Add vault data state
+    // Updated vault data state with all required fields
     const [vaultData, setVaultData] = useState({
         collateral: "0",
         debt: "0",
+        updatedDebt: "0",
         zeroLiquidation: false,
+        collateralRatio: 0,
+        liquidationPrice: "0",
+        safetyBuffer: 0,
+        maxMintable: "0",
+        accruedInterest: "0",
+        liquidationRisk: 0, // 0=Low, 1=Medium, 2=High, 3=Critical
+        ethPrice: "0",
+        annualInterestRate: 0,
+        timeUntilRebalance: 0,
         loading: true
-    })
+    });
 
-    // 3. Get contract instance
+    // Additional state for wallet balances
+    const [walletBalances, setWalletBalances] = useState({
+        ethBalance: "0",
+        usdBalance: "0",
+        loading: true
+    });
+
+    // Get contract instance
     const vaultManager = useVaultManager()
+
+    const [actionLoading, setActionLoading] = useState({
+        deposit: false,
+        withdraw: false,
+        mint: false,
+        repay: false
+    });
+
+    const [actionAmounts, setActionAmounts] = useState({
+        depositAmount: "",
+        withdrawAmount: "",
+        mintAmount: "",
+        repayAmount: ""
+    });
+
+    const handleTransactionError = (error: any, action: string) => {
+        console.error(`❌ ${action} failed:`, error);
+
+        let errorMessage = `${action} failed`;
+
+        if (error.reason) {
+            errorMessage = error.reason;
+        } else if (error.data?.message) {
+            errorMessage = error.data.message;
+        } else if (error.message) {
+            if (error.message.includes("user rejected")) {
+                errorMessage = "Transaction cancelled by user";
+            } else if (error.message.includes("insufficient funds")) {
+                errorMessage = "Insufficient funds";
+            } else {
+                errorMessage = error.message;
+            }
+        }
+
+        toast.error(errorMessage);
+    };
+
+    const getUSDTokenAddress = async () => {
+        try {
+            const contractAddresses = await import("../../constants/contract-addresses.json");
+            return contractAddresses.USDToken;
+        } catch (error) {
+            console.error("Could not load contract addresses:", error);
+            return null;
+        }
+    };
+
+    
+    const depositCollateral = async (amount: string) => {
+        if (!vaultManager || !walletAddress || !amount || parseFloat(amount) <= 0) {
+            toast.error("Please enter a valid amount");
+            return;
+        }
+
+        setActionLoading(prev => ({ ...prev, deposit: true }));
+
+        try {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const contractWithSigner = vaultManager.connect(signer);
+
+            console.log(`📥 Depositing ${amount} ETH as collateral...`);
+
+            // Convert amount to Wei
+            const amountWei = ethers.parseEther(amount);
+
+            // Check if user has enough ETH
+            const balance = await provider.getBalance(walletAddress);
+            if (balance < amountWei) {
+                throw new Error("Insufficient ETH balance");
+            }
+
+            // Send transaction
+            const tx = await contractWithSigner.depositCollateral({
+                value: amountWei,
+                gasLimit: 300000 // Set reasonable gas limit
+            });
+
+            toast.loading("Transaction pending...", { id: "deposit" });
+
+            // Wait for confirmation
+            const receipt = await tx.wait();
+
+            if (receipt.status === 1) {
+                toast.success(`Successfully deposited ${amount} ETH`, { id: "deposit" });
+
+                // Clear input and refresh data
+                setActionAmounts(prev => ({ ...prev, depositAmount: "" }));
+
+                // Refresh vault data
+                setTimeout(() => {
+                    window.location.reload(); // Simple refresh, you could make this more elegant
+                }, 2000);
+
+            } else {
+                throw new Error("Transaction failed");
+            }
+
+        } catch (error: any) {
+            toast.dismiss("deposit");
+            handleTransactionError(error, "Deposit");
+        } finally {
+            setActionLoading(prev => ({ ...prev, deposit: false }));
+        }
+    };
+
+    // 2. WITHDRAW COLLATERAL
+    const withdrawCollateral = async (amount: string) => {
+        if (!vaultManager || !walletAddress || !amount || parseFloat(amount) <= 0) {
+            toast.error("Please enter a valid amount");
+            return;
+        }
+
+        setActionLoading(prev => ({ ...prev, withdraw: true }));
+
+        try {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const contractWithSigner = vaultManager.connect(signer);
+
+            console.log(`📤 Withdrawing ${amount} ETH collateral...`);
+
+            const amountWei = ethers.parseEther(amount);
+
+            // Check if user has enough collateral
+            if (parseFloat(amount) > parseFloat(vaultData.collateral)) {
+                throw new Error("Insufficient collateral to withdraw");
+            }
+
+            const tx = await contractWithSigner.withdrawCollateral(amountWei, {
+                gasLimit: 300000
+            });
+
+            toast.loading("Transaction pending...", { id: "withdraw" });
+
+            const receipt = await tx.wait();
+
+            if (receipt.status === 1) {
+                toast.success(`Successfully withdrew ${amount} ETH`, { id: "withdraw" });
+                setActionAmounts(prev => ({ ...prev, withdrawAmount: "" }));
+
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+
+            } else {
+                throw new Error("Transaction failed");
+            }
+
+        } catch (error: any) {
+            toast.dismiss("withdraw");
+            handleTransactionError(error, "Withdraw");
+        } finally {
+            setActionLoading(prev => ({ ...prev, withdraw: false }));
+        }
+    };
+
+    // 3. MINT MyUSD
+    const mintMyUSD = async (amount: string) => {
+        if (!vaultManager || !walletAddress || !amount || parseFloat(amount) <= 0) {
+            toast.error("Please enter a valid amount");
+            return;
+        }
+
+        setActionLoading(prev => ({ ...prev, mint: true }));
+
+        try {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const contractWithSigner = vaultManager.connect(signer);
+
+            console.log(`💰 Minting ${amount} MyUSD...`);
+
+            const amountWei = ethers.parseUnits(amount, 18); // MyUSD has 18 decimals
+
+            // Check if user has enough collateral to maintain ratio
+            const maxMintable = parseFloat(vaultData.maxMintable);
+            if (parseFloat(amount) > maxMintable) {
+                throw new Error(`Can only mint up to $${maxMintable.toFixed(2)} MyUSD with current collateral`);
+            }
+
+            const tx = await contractWithSigner.mint(amountWei, {
+                gasLimit: 400000
+            });
+
+            toast.loading("Transaction pending...", { id: "mint" });
+
+            const receipt = await tx.wait();
+
+            if (receipt.status === 1) {
+                toast.success(`Successfully minted $${amount} MyUSD`, { id: "mint" });
+                setActionAmounts(prev => ({ ...prev, mintAmount: "" }));
+
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+
+            } else {
+                throw new Error("Transaction failed");
+            }
+
+        } catch (error: any) {
+            toast.dismiss("mint");
+            handleTransactionError(error, "Mint");
+        } finally {
+            setActionLoading(prev => ({ ...prev, mint: false }));
+        }
+    };
+
+    // 4. REPAY DEBT
+    const repayDebt = async (amount: string) => {
+        if (!vaultManager || !walletAddress || !amount || parseFloat(amount) <= 0) {
+            toast.error("Please enter a valid amount");
+            return;
+        }
+
+        setActionLoading(prev => ({ ...prev, repay: true }));
+
+        try {
+            const provider = new ethers.BrowserProvider(window.ethereum);
+            const signer = await provider.getSigner();
+            const contractWithSigner = vaultManager.connect(signer);
+
+            console.log(`💸 Repaying ${amount} MyUSD debt...`);
+
+            const amountWei = ethers.parseUnits(amount, 18);
+
+            // Check if user has enough MyUSD to repay
+            if (parseFloat(amount) > parseFloat(walletBalances.usdBalance)) {
+                throw new Error("Insufficient MyUSD balance to repay");
+            }
+
+            // Check if trying to repay more than owed
+            if (parseFloat(amount) > parseFloat(vaultData.updatedDebt)) {
+                throw new Error(`Cannot repay more than debt amount: ${parseFloat(vaultData.updatedDebt).toFixed(2)}`);
+            }
+
+            // First approve the contract to spend MyUSD tokens
+            // Update the repayDebt function to use dynamic USD token address:
+            // Replace "YOUR_USD_TOKEN_ADDRESS" with:
+            const usdTokenAddress = await getUSDTokenAddress();
+            if (!usdTokenAddress) {
+                throw new Error("USD Token contract address not found");
+            }
+            const usdTokenABI = [
+                "function approve(address spender, uint256 amount) external returns (bool)",
+                "function allowance(address owner, address spender) external view returns (uint256)"
+            ];
+
+            const usdToken = new ethers.Contract(usdTokenAddress, usdTokenABI, signer);
+
+            // Check current allowance
+            const currentAllowance = await usdToken.allowance(walletAddress, vaultManager.target);
+
+            if (currentAllowance < amountWei) {
+                console.log("🔐 Approving MyUSD spending...");
+                const approveTx = await usdToken.approve(vaultManager.target, amountWei);
+                await approveTx.wait();
+                console.log("✅ Approval confirmed");
+            }
+
+            const tx = await contractWithSigner.repay(amountWei, {
+                gasLimit: 400000
+            });
+
+            toast.loading("Transaction pending...", { id: "repay" });
+
+            const receipt = await tx.wait();
+
+            if (receipt.status === 1) {
+                toast.success(`Successfully repaid ${amount} MyUSD`, { id: "repay" });
+                setActionAmounts(prev => ({ ...prev, repayAmount: "" }));
+
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+
+            } else {
+                throw new Error("Transaction failed");
+            }
+
+        } catch (error: any) {
+            toast.dismiss("repay");
+            handleTransactionError(error, "Repay");
+        } finally {
+            setActionLoading(prev => ({ ...prev, repay: false }));
+        }
+    };
+
+    const validateDepositAmount = (amount: string): boolean => {
+        const numAmount = parseFloat(amount);
+        if (isNaN(numAmount) || numAmount <= 0) return false;
+
+        // Check if user has enough ETH (leave some for gas)
+        const maxDeposit = parseFloat(walletBalances.ethBalance) - 0.01; // Reserve 0.01 ETH for gas
+        return numAmount <= maxDeposit;
+    };
+
+    const validateWithdrawAmount = (amount: string): boolean => {
+        const numAmount = parseFloat(amount);
+        if (isNaN(numAmount) || numAmount <= 0) return false;
+
+        // Check if user has enough collateral
+        return numAmount <= parseFloat(vaultData.collateral);
+    };
+
+    const validateMintAmount = (amount: string): boolean => {
+        const numAmount = parseFloat(amount);
+        if (isNaN(numAmount) || numAmount <= 0) return false;
+
+        // Check against max mintable
+        return numAmount <= parseFloat(vaultData.maxMintable);
+    };
+
+    const validateRepayAmount = (amount: string): boolean => {
+        const numAmount = parseFloat(amount);
+        if (isNaN(numAmount) || numAmount <= 0) return false;
+
+        // Check if user has enough MyUSD and not repaying more than owed
+        return numAmount <= parseFloat(walletBalances.usdBalance) &&
+            numAmount <= parseFloat(vaultData.updatedDebt);
+    };
+
+    // MODAL COMPONENT FOR ACTIONS
+    const ActionModal = ({
+        isOpen,
+        onClose,
+        title,
+        action,
+        amount,
+        setAmount,
+        onSubmit,
+        isLoading,
+        maxAmount,
+        unit,
+        validateAmount
+    }: {
+        isOpen: boolean;
+        onClose: () => void;
+        title: string;
+        action: string;
+        amount: string;
+        setAmount: (amount: string) => void;
+        onSubmit: () => void;
+        isLoading: boolean;
+        maxAmount: string;
+        unit: string;
+        validateAmount: (amount: string) => boolean;
+    }) => {
+        if (!isOpen) return null;
+
+        const isValid = validateAmount(amount);
+
+        return (
+            <div className="fixed inset-0 z-50 flex items-center justify-center">
+                <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+                <div className="relative z-10 bg-white/10 backdrop-blur-xl border border-white/20 rounded-2xl p-6 max-w-md w-full mx-4">
+                    <div className="space-y-4">
+                        <div className="text-center">
+                            <h3 className="text-xl font-bold text-white">{title}</h3>
+                            <p className="text-gray-400 text-sm mt-1">
+                                Available: {parseFloat(maxAmount).toFixed(4)} {unit}
+                            </p>
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-sm text-gray-300">Amount</label>
+                            <div className="relative">
+                                <input
+                                    type="number"
+                                    value={amount}
+                                    onChange={(e) => setAmount(e.target.value)}
+                                    placeholder={`Enter amount in ${unit}`}
+                                    className="w-full bg-white/5 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
+                                    step="0.0001"
+                                    min="0"
+                                />
+                                <button
+                                    onClick={() => setAmount(maxAmount)}
+                                    className="absolute right-2 top-1/2 transform -translate-y-1/2 text-xs bg-blue-500 hover:bg-blue-600 text-white px-2 py-1 rounded"
+                                >
+                                    MAX
+                                </button>
+                            </div>
+                            {amount && !isValid && (
+                                <p className="text-red-400 text-xs">Invalid amount</p>
+                            )}
+                        </div>
+
+                        <div className="flex gap-3 pt-4">
+                            <Button
+                                onClick={onClose}
+                                variant="outline"
+                                className="flex-1 bg-gray-600 hover:bg-gray-700 border-gray-600"
+                                disabled={isLoading}
+                            >
+                                Cancel
+                            </Button>
+                            <Button
+                                onClick={onSubmit}
+                                className="flex-1 bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-600 hover:to-purple-600"
+                                disabled={!isValid || isLoading}
+                            >
+                                {isLoading ? (
+                                    <>
+                                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                        {action}...
+                                    </>
+                                ) : (
+                                    action
+                                )}
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    // MODAL STATE MANAGEMENT
+    const [activeModal, setActiveModal] = useState<string | null>(null);
+
+    // MODAL FUNCTIONS
+    const openDepositModal = () => setActiveModal("deposit");
+    const openWithdrawModal = () => setActiveModal("withdraw");
+    const openMintModal = () => setActiveModal("mint");
+    const openRepayModal = () => setActiveModal("repay");
+    const closeModal = () => setActiveModal(null);
+
+
+
     // Real MetaMask connection function
     const connectWallet = async () => {
         if (!window.ethereum) {
@@ -135,11 +589,9 @@ export default function VaultDashboard() {
         if (window.ethereum) {
             const handleAccountsChanged = (accounts: string[]) => {
                 if (accounts.length === 0) {
-                    // User disconnected
                     setIsConnected(false);
                     setWalletAddress("");
                 } else {
-                    // User switched accounts
                     setWalletAddress(accounts[0]);
                     setIsConnected(true);
                 }
@@ -147,7 +599,6 @@ export default function VaultDashboard() {
 
             window.ethereum.on("accountsChanged", handleAccountsChanged);
 
-            // Check if already connected on mount
             const checkConnection = async () => {
                 try {
                     const accounts = await window.ethereum.request({ method: "eth_accounts" });
@@ -168,10 +619,9 @@ export default function VaultDashboard() {
         }
     }, []);
 
-    // 6. useEffect for loading vault data
+    // Load vault data
     useEffect(() => {
         const loadAllVaultData = async () => {
-            // Wait for both vaultManager AND walletAddress
             if (!vaultManager || !walletAddress) {
                 console.log("Waiting for:", {
                     vaultManager: !!vaultManager,
@@ -181,35 +631,136 @@ export default function VaultDashboard() {
             }
 
             console.log("🎯 Both vaultManager and wallet ready - loading data...");
+            setVaultData(prev => ({ ...prev, loading: true }));
+            setWalletBalances(prev => ({ ...prev, loading: true }));
 
             try {
-                // Get signer for write operations
                 const provider = new ethers.BrowserProvider(window.ethereum);
-                const signer = await provider.getSigner();
-                const contractWithSigner = vaultManager.connect(signer);
+                const network = await provider.getNetwork();
+                console.log("🌐 Connected to network:", network.name, "Chain ID:", network.chainId);
 
-                const [vault, updatedDebt] = await Promise.all([
-                    contractWithSigner.vaults(walletAddress),
-                    contractWithSigner.getUpdatedDebt(walletAddress)
-                ]);
+                // Check if contract exists
+                const contractCode = await provider.getCode(vaultManager.target);
+                if (contractCode === "0x") {
+                    throw new Error("Contract not deployed on this network");
+                }
 
-                console.log("✅ Vault data loaded:", { vault, updatedDebt });
+                const contractWithProvider = vaultManager.connect(provider);
 
-                setVaultData({
-                    collateral: ethers.formatEther(vault.collateralETH || 0),
-                    debt: ethers.formatEther(updatedDebt || 0),
-                    zeroLiquidation: vault.zeroLiquidation || false,
+                // Try getDashboardData first, fallback to individual calls
+                try {
+                    const dashboardData = await contractWithProvider.getDashboardData(walletAddress);
+
+                    setVaultData({
+                        collateral: ethers.formatEther(dashboardData.collateralETH || 0),
+                        debt: ethers.formatEther(dashboardData.debtMyUSD || 0),
+                        updatedDebt: ethers.formatEther(dashboardData.updatedDebt || 0),
+                        zeroLiquidation: dashboardData.zeroLiquidation || false,
+                        collateralRatio: Number(ethers.formatUnits(dashboardData.collateralRatio, 16)),
+                        liquidationPrice: ethers.formatUnits(dashboardData.liquidationPrice, 8),
+                        safetyBuffer: Number(dashboardData.safetyBuffer) / 100,
+                        maxMintable: ethers.formatEther(dashboardData.maxMintable || 0),
+                        accruedInterest: ethers.formatEther(dashboardData.accruedInterest || 0),
+                        liquidationRisk: Number(dashboardData.liquidationRisk),
+                        ethPrice: ethers.formatUnits(dashboardData.ethPrice, 8),
+                        annualInterestRate: Number(dashboardData.annualInterestRate) / 100,
+                        timeUntilRebalance: Number(dashboardData.timeUntilRebalance),
+                        loading: false
+                    });
+                } catch (error) {
+                    console.log("getDashboardData not available, using individual calls...");
+
+                    // Fallback to individual calls
+                    const [
+                        vaultInfo,
+                        updatedDebt,
+                        collateralRatio,
+                        ethPrice,
+                    ] = await Promise.all([
+                        contractWithProvider.getVault(walletAddress),
+                        contractWithProvider.getUpdatedDebt(walletAddress),
+                        contractWithProvider.getCollateralRatio(walletAddress),
+                        contractWithProvider.getLatestPrice(),
+                    ]);
+
+                    console.log("✅ Individual vault data loaded");
+
+                    setVaultData({
+                        collateral: ethers.formatEther(vaultInfo[0] || 0),
+                        debt: ethers.formatEther(vaultInfo[1] || 0),
+                        updatedDebt: ethers.formatEther(updatedDebt || 0),
+                        zeroLiquidation: vaultInfo[2] || false,
+                        collateralRatio: collateralRatio === ethers.MaxUint256 ? 0 : Number(ethers.formatUnits(collateralRatio, 16)),
+                        liquidationPrice: "0", // Will need new functions
+                        safetyBuffer: 0,
+                        maxMintable: "0",
+                        accruedInterest: "0",
+                        liquidationRisk: 0,
+                        ethPrice: ethers.formatUnits(ethPrice, 8),
+                        annualInterestRate: 0,
+                        timeUntilRebalance: 0,
+                        loading: false
+                    });
+                }
+
+                // Load wallet balances
+                const ethBalance = await provider.getBalance(walletAddress);
+                
+                // Load USD token balance
+                let usdBalance = "0";
+                try {
+                    const usdTokenAddress = await getUSDTokenAddress();
+                    if (usdTokenAddress) {
+                        const usdTokenABI = [
+                            "function balanceOf(address owner) external view returns (uint256)"
+                        ];
+                        const usdToken = new ethers.Contract(usdTokenAddress, usdTokenABI, provider);
+                        const balance = await usdToken.balanceOf(walletAddress);
+                        usdBalance = ethers.formatEther(balance);
+                        console.log("💰 USD Balance loaded:", usdBalance, "MyUSD");
+                    } else {
+                        console.log("⚠️ USD Token address not found");
+                    }
+                } catch (error) {
+                    console.log("⚠️ Could not load USD balance:", error);
+                    // Keep usdBalance as "0" if there's an error
+                }
+
+                setWalletBalances({
+                    ethBalance: ethers.formatEther(ethBalance),
+                    usdBalance: usdBalance,
                     loading: false
                 });
             } catch (error) {
                 console.error("❌ Error loading vault data:", error);
-                setVaultData(prev => ({ ...prev, loading: false }));
+
+                setVaultData({
+                    collateral: "0",
+                    debt: "0",
+                    updatedDebt: "0",
+                    zeroLiquidation: false,
+                    collateralRatio: 0,
+                    liquidationPrice: "0",
+                    safetyBuffer: 0,
+                    maxMintable: "0",
+                    accruedInterest: "0",
+                    liquidationRisk: 0,
+                    ethPrice: "0",
+                    annualInterestRate: 0,
+                    timeUntilRebalance: 0,
+                    loading: false
+                });
+
+                setWalletBalances({
+                    ethBalance: "0",
+                    usdBalance: "0",
+                    loading: false
+                });
             }
         };
 
         loadAllVaultData();
     }, [vaultManager, walletAddress]);
-
 
     const getRiskColor = (ratio: number) => {
         if (ratio >= 200) return "text-green-400"
@@ -243,26 +794,14 @@ export default function VaultDashboard() {
         return `${address.slice(0, 6)}...${address.slice(-4)}`
     }
 
-
-
-
-
-
-
-
-
     return (
         <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4 relative">
             {/* Wallet Connection Overlay */}
             {!isConnected && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center">
-                    {/* Backdrop */}
                     <div className="absolute inset-0 bg-black/50 backdrop-blur-lg" />
-
-                    {/* Connection Card */}
                     <div className="relative z-10 bg-white/10 backdrop-blur-xl border border-white/20 rounded-2xl p-8 max-w-md w-full mx-4 shadow-2xl">
                         <div className="text-center space-y-6">
-                            {/* MetaMask Logo */}
                             <div className="flex justify-center">
                                 <div className="w-16 h-16 bg-gradient-to-br from-orange-400 to-orange-600 rounded-2xl flex items-center justify-center shadow-lg">
                                     <svg className="w-10 h-10 text-white" viewBox="0 0 24 24" fill="currentColor">
@@ -273,14 +812,10 @@ export default function VaultDashboard() {
                                     </svg>
                                 </div>
                             </div>
-
-                            {/* Title and Subtitle */}
                             <div className="space-y-2">
                                 <h2 className="text-2xl font-bold text-white">Connect Your Wallet</h2>
                                 <p className="text-gray-300">Connect MetaMask to access your vault dashboard</p>
                             </div>
-
-                            {/* Connect Button */}
                             <Button
                                 onClick={connectWallet}
                                 disabled={isConnecting}
@@ -295,8 +830,6 @@ export default function VaultDashboard() {
                                     "Connect Wallet"
                                 )}
                             </Button>
-
-                            {/* Small Text */}
                             <p className="text-sm text-gray-400">
                                 MetaMask required to interact with DeFi protocol
                             </p>
@@ -314,11 +847,11 @@ export default function VaultDashboard() {
                     </h1>
                     <div className="flex items-center justify-center gap-2 text-gray-300">
                         <Wallet className="h-4 w-4" />
-                        <span className="font-mono text-sm">{mockData.walletAddress}</span>
+                        <span className="font-mono text-sm">{truncateAddress(walletAddress)}</span>
                     </div>
                 </div>
 
-                {/* Wallet Status Indicator (when connected) */}
+                {/* Wallet Status Indicator */}
                 {isConnected && (
                     <div className="fixed top-4 right-4 z-40">
                         <div className="bg-white/10 backdrop-blur-lg border border-white/20 rounded-lg p-3 group hover:bg-white/20 transition-all duration-200">
@@ -340,7 +873,6 @@ export default function VaultDashboard() {
                     </div>
                 )}
 
-                {/* Rest of the dashboard content remains the same... */}
                 {/* Tab Navigation */}
                 <div className="flex justify-center">
                     <div className="bg-white/5 backdrop-blur-lg border border-white/10 rounded-lg p-1">
@@ -367,10 +899,10 @@ export default function VaultDashboard() {
                     </div>
                 </div>
 
-                {/* Tab Content - keep all existing content exactly as it was */}
+                {/* Tab Content */}
                 {activeTab === "dashboard" ? (
                     <>
-                        {/* Priority 1: Vault Overview Panel */}
+                        {/* Vault Overview Panel */}
                         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
                             <Card className="bg-white/5 backdrop-blur-lg border-white/10 hover:bg-white/10 transition-all duration-300">
                                 <CardHeader className="pb-2">
@@ -379,10 +911,7 @@ export default function VaultDashboard() {
                                 <CardContent>
                                     <div className="text-2xl font-bold text-white">{vaultData.collateral} ETH</div>
                                     <div className="text-sm text-gray-400 mt-1">
-                                        ≈ $
-                                        {(
-                                            Number.parseFloat(mockData.collateralETH) * Number.parseFloat(mockData.ethPrice.replace(",", ""))
-                                        ).toLocaleString()}
+                                        ≈ ${(Number.parseFloat(vaultData.collateral) * Number.parseFloat(vaultData.ethPrice)).toLocaleString()}
                                     </div>
                                 </CardContent>
                             </Card>
@@ -392,7 +921,9 @@ export default function VaultDashboard() {
                                     <CardTitle className="text-sm font-medium text-gray-400">Current Debt</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <div className="text-2xl font-bold text-white">${mockData.debtMyUSD} MyUSD</div>
+                                    <div className="text-2xl font-bold text-white">
+                                        {vaultData.loading ? "Loading..." : `$${Number.parseFloat(vaultData.updatedDebt).toFixed(2)} MyUSD`}
+                                    </div>
                                     <div className="text-sm text-gray-400 mt-1">Stable value</div>
                                 </CardContent>
                             </Card>
@@ -402,10 +933,10 @@ export default function VaultDashboard() {
                                     <CardTitle className="text-sm font-medium text-gray-400">Collateral Ratio</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <div className={`text-2xl font-bold ${getRiskColor(mockData.collateralRatio)}`}>
-                                        {mockData.collateralRatio}%
+                                    <div className={`text-2xl font-bold ${getRiskColor(vaultData.collateralRatio)}`}>
+                                        {vaultData.collateralRatio.toFixed(0)}%
                                     </div>
-                                    <Progress value={Math.min(mockData.collateralRatio, 300)} max={300} className="mt-2 h-2" />
+                                    <Progress value={Math.min(vaultData.collateralRatio, 300)} max={300} className="mt-2 h-2" />
                                     <div className="text-xs text-gray-400 mt-1">Min: 150%</div>
                                 </CardContent>
                             </Card>
@@ -415,9 +946,9 @@ export default function VaultDashboard() {
                                     <CardTitle className="text-sm font-medium text-gray-400">Liquidation Risk</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <Badge className={`${getRiskBadgeColor(mockData.liquidationRisk)} mb-2`}>
+                                    <Badge className={`${getRiskBadgeColor(getRiskLevelString(vaultData.liquidationRisk))} mb-2`}>
                                         <AlertTriangle className="h-3 w-3 mr-1" />
-                                        {mockData.liquidationRisk}
+                                        {getRiskLevelString(vaultData.liquidationRisk)}
                                     </Badge>
                                     <div className="text-sm text-gray-400">Monitor closely</div>
                                 </CardContent>
@@ -425,7 +956,7 @@ export default function VaultDashboard() {
                         </div>
 
                         <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-                            {/* Priority 2: Market Information Panel */}
+                            {/* Market Information Panel */}
                             <div className="xl:col-span-1">
                                 <div className="grid grid-cols-1 gap-4">
                                     <Card className="bg-white/5 backdrop-blur-lg border-white/10 hover:bg-white/10 transition-all duration-300">
@@ -436,7 +967,7 @@ export default function VaultDashboard() {
                                             </CardTitle>
                                         </CardHeader>
                                         <CardContent>
-                                            <div className="text-xl font-bold text-green-400">${mockData.ethPrice}</div>
+                                            <div className="text-xl font-bold text-green-400">${Number.parseFloat(vaultData.ethPrice).toLocaleString()}</div>
                                         </CardContent>
                                     </Card>
 
@@ -448,7 +979,7 @@ export default function VaultDashboard() {
                                             </CardTitle>
                                         </CardHeader>
                                         <CardContent>
-                                            <div className="text-xl font-bold text-blue-400">{mockData.interestRate}%</div>
+                                            <div className="text-xl font-bold text-blue-400">{vaultData.annualInterestRate.toFixed(1)}%</div>
                                         </CardContent>
                                     </Card>
 
@@ -460,40 +991,59 @@ export default function VaultDashboard() {
                                             </CardTitle>
                                         </CardHeader>
                                         <CardContent>
-                                            <div className="text-xl font-bold text-purple-400">{mockData.timeUntilRebalance}</div>
+                                            <div className="text-xl font-bold text-purple-400">{formatTimeUntilRebalance(vaultData.timeUntilRebalance)}</div>
                                         </CardContent>
                                     </Card>
                                 </div>
                             </div>
 
-                            {/* Priority 3: Action Buttons Panel */}
+                            {/* Action Buttons Panel */}
                             <div className="xl:col-span-2">
                                 <Card className="bg-white/5 backdrop-blur-lg border-white/10 h-full">
                                     <CardHeader>
                                         <CardTitle className="text-lg font-semibold text-white">Vault Actions</CardTitle>
                                     </CardHeader>
                                     <CardContent className="space-y-4">
-                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                                            <Button className="bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold py-3 h-auto">
-                                                <Plus className="h-4 w-4 mr-2" />
-                                                Deposit Collateral
-                                            </Button>
+                                        {vaultData.loading ? (
+                                            <div className="text-center py-4">
+                                                <Loader2 className="h-8 w-8 animate-spin mx-auto text-blue-400" />
+                                                <p className="text-gray-400 mt-2">Loading vault data...</p>
+                                            </div>
+                                        ) : (
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                <Button
+                                                    onClick={openDepositModal}
+                                                    className="bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold py-3 h-auto"
+                                                >
+                                                    <Plus className="h-4 w-4 mr-2" />
+                                                    Deposit Collateral
+                                                </Button>
+                                                <Button
+                                                    onClick={openMintModal}
+                                                    className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold py-3 h-auto"
+                                                >
+                                                    <DollarSign className="h-4 w-4 mr-2" />
+                                                    Mint MyUSD
+                                                </Button>
 
-                                            <Button className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold py-3 h-auto">
-                                                <DollarSign className="h-4 w-4 mr-2" />
-                                                Mint MyUSD
-                                            </Button>
-
-                                            <Button className="bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white font-semibold py-3 h-auto">
-                                                <Minus className="h-4 w-4 mr-2" />
-                                                Withdraw Collateral
-                                            </Button>
-
-                                            <Button className="bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white font-semibold py-3 h-auto">
-                                                <RefreshCw className="h-4 w-4 mr-2" />
-                                                Repay Debt
-                                            </Button>
-                                        </div>
+                                                <Button
+                                                    onClick={openWithdrawModal}
+                                                    className="bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 text-white font-semibold py-3 h-auto"
+                                                    disabled={parseFloat(vaultData.collateral) === 0}
+                                                >
+                                                    <Minus className="h-4 w-4 mr-2" />
+                                                    Withdraw Collateral
+                                                </Button>
+                                                <Button
+                                                    onClick={openRepayModal}
+                                                    className="bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white font-semibold py-3 h-auto"
+                                                    disabled={parseFloat(vaultData.updatedDebt) === 0}
+                                                >
+                                                    <RefreshCw className="h-4 w-4 mr-2" />
+                                                    Repay Debt
+                                                </Button>
+                                            </div>
+                                        )}
 
                                         <div className="flex items-center justify-between p-4 bg-white/5 rounded-lg border border-white/10">
                                             <div className="flex items-center gap-3">
@@ -504,9 +1054,10 @@ export default function VaultDashboard() {
                                                 </div>
                                             </div>
                                             <Switch
-                                                checked={zeroLiquidation}
+                                                checked={vaultData.zeroLiquidation}
                                                 onCheckedChange={setZeroLiquidation}
                                                 className="data-[state=checked]:bg-blue-500"
+                                                disabled={vaultData.loading}
                                             />
                                         </div>
                                     </CardContent>
@@ -514,7 +1065,7 @@ export default function VaultDashboard() {
                             </div>
                         </div>
 
-                        {/* Priority 4: Risk Management Panel */}
+                        {/* Risk Management Panel */}
                         <Card className="bg-white/5 backdrop-blur-lg border-white/10">
                             <CardHeader>
                                 <CardTitle className="text-lg font-semibold text-white flex items-center gap-2">
@@ -526,43 +1077,45 @@ export default function VaultDashboard() {
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                                     <div className="space-y-2">
                                         <div className="text-sm font-medium text-gray-400">Liquidation Price</div>
-                                        <div className="text-xl font-bold text-red-400">${mockData.liquidationPrice}</div>
+                                        <div className="text-xl font-bold text-red-400">${Number.parseFloat(vaultData.liquidationPrice).toLocaleString()}</div>
                                         <div className="text-xs text-gray-500">ETH price threshold</div>
                                     </div>
 
                                     <div className="space-y-2">
                                         <div className="text-sm font-medium text-gray-400">Safety Buffer</div>
-                                        <div className="text-xl font-bold text-green-400">{mockData.safetyBuffer}%</div>
+                                        <div className="text-xl font-bold text-green-400">{vaultData.safetyBuffer.toFixed(1)}%</div>
                                         <div className="text-xs text-gray-500">Above liquidation</div>
                                     </div>
 
                                     <div className="space-y-2">
                                         <div className="text-sm font-medium text-gray-400">Required vs Current</div>
                                         <div className="text-xl font-bold">
-                                            <span className="text-red-400">{mockData.requiredRatio}%</span>
+                                            <span className="text-red-400">150%</span>
                                             <span className="text-gray-500 mx-2">vs</span>
-                                            <span className={getRiskColor(mockData.currentRatio)}>{mockData.currentRatio}%</span>
+                                            <span className={getRiskColor(vaultData.collateralRatio)}>{vaultData.collateralRatio.toFixed(0)}%</span>
                                         </div>
                                         <div className="text-xs text-gray-500">Collateral ratio</div>
                                     </div>
 
                                     <div className="space-y-2">
                                         <div className="text-sm font-medium text-gray-400">Max Mintable</div>
-                                        <div className="text-xl font-bold text-blue-400">${mockData.maxMintable}</div>
+                                        <div className="text-xl font-bold text-blue-400">${Number.parseFloat(vaultData.maxMintable).toLocaleString()}</div>
                                         <div className="text-xs text-gray-500">Additional MyUSD</div>
                                     </div>
                                 </div>
                             </CardContent>
                         </Card>
 
-                        {/* Priority 5: Account Balances Panel */}
+                        {/* Account Balances Panel */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                             <Card className="bg-white/5 backdrop-blur-lg border-white/10 hover:bg-white/10 transition-all duration-300">
                                 <CardHeader className="pb-2">
                                     <CardTitle className="text-sm font-medium text-gray-400">Wallet ETH Balance</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <div className="text-2xl font-bold text-white">{mockData.ethBalance} ETH</div>
+                                    <div className="text-2xl font-bold text-white">
+                                        {walletBalances.loading ? "Loading..." : `${Number.parseFloat(walletBalances.ethBalance).toFixed(4)} ETH`}
+                                    </div>
                                     <div className="text-sm text-gray-400 mt-1">Available for deposit</div>
                                 </CardContent>
                             </Card>
@@ -572,7 +1125,9 @@ export default function VaultDashboard() {
                                     <CardTitle className="text-sm font-medium text-gray-400">MyUSD Balance</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <div className="text-2xl font-bold text-white">${mockData.myUSDBalance}</div>
+                                    <div className="text-2xl font-bold text-white">
+                                        {walletBalances.loading ? "Loading..." : `${Number.parseFloat(walletBalances.usdBalance).toFixed(2)}`}
+                                    </div>
                                     <div className="text-sm text-gray-400 mt-1">Liquid stablecoin</div>
                                 </CardContent>
                             </Card>
@@ -582,16 +1137,15 @@ export default function VaultDashboard() {
                                     <CardTitle className="text-sm font-medium text-gray-400">Accrued Interest</CardTitle>
                                 </CardHeader>
                                 <CardContent>
-                                    <div className="text-2xl font-bold text-yellow-400">${mockData.accruedInterest}</div>
+                                    <div className="text-2xl font-bold text-yellow-400">${Number.parseFloat(vaultData.accruedInterest).toFixed(2)}</div>
                                     <div className="text-sm text-gray-400 mt-1">Pending charges</div>
                                 </CardContent>
                             </Card>
                         </div>
                     </>
                 ) : (
-                    /* Liquidation Market Tab - keep all existing content */
+                    /* Liquidation Market Tab */
                     <div className="space-y-6">
-                        {/* All existing liquidation market content remains unchanged */}
                         {/* Market Stats */}
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <Card className="bg-white/5 backdrop-blur-lg border-white/10">
@@ -663,7 +1217,7 @@ export default function VaultDashboard() {
                                                     <td className="py-4 px-4">
                                                         <div className="text-white font-medium">{vault.collateralETH} ETH</div>
                                                         <div className="text-xs text-gray-400">
-                                                            ≈ ${(parseFloat(vault.collateralETH) * parseFloat(mockData.ethPrice.replace(",", ""))).toLocaleString()}
+                                                            ≈ ${(parseFloat(vault.collateralETH) * parseFloat(vaultData.ethPrice || "2450")).toLocaleString()}
                                                         </div>
                                                     </td>
                                                     <td className="py-4 px-4">
@@ -711,6 +1265,62 @@ export default function VaultDashboard() {
                     </div>
                 )}
             </div>
+            {/* Action Modals - ADD THESE AT THE END */}
+            <ActionModal
+                isOpen={activeModal === "deposit"}
+                onClose={closeModal}
+                title="Deposit Collateral"
+                action="Deposit"
+                amount={actionAmounts.depositAmount}
+                setAmount={(amount) => setActionAmounts(prev => ({ ...prev, depositAmount: amount }))}
+                onSubmit={() => depositCollateral(actionAmounts.depositAmount)}
+                isLoading={actionLoading.deposit}
+                maxAmount={(parseFloat(walletBalances.ethBalance) - 0.01).toFixed(4)}
+                unit="ETH"
+                validateAmount={validateDepositAmount}
+            />
+
+            <ActionModal
+                isOpen={activeModal === "withdraw"}
+                onClose={closeModal}
+                title="Withdraw Collateral"
+                action="Withdraw"
+                amount={actionAmounts.withdrawAmount}
+                setAmount={(amount) => setActionAmounts(prev => ({ ...prev, withdrawAmount: amount }))}
+                onSubmit={() => withdrawCollateral(actionAmounts.withdrawAmount)}
+                isLoading={actionLoading.withdraw}
+                maxAmount={vaultData.collateral}
+                unit="ETH"
+                validateAmount={validateWithdrawAmount}
+            />
+
+            <ActionModal
+                isOpen={activeModal === "mint"}
+                onClose={closeModal}
+                title="Mint MyUSD"
+                action="Mint"
+                amount={actionAmounts.mintAmount}
+                setAmount={(amount) => setActionAmounts(prev => ({ ...prev, mintAmount: amount }))}
+                onSubmit={() => mintMyUSD(actionAmounts.mintAmount)}
+                isLoading={actionLoading.mint}
+                maxAmount={vaultData.maxMintable}
+                unit="MyUSD"
+                validateAmount={validateMintAmount}
+            />
+
+            <ActionModal
+                isOpen={activeModal === "repay"}
+                onClose={closeModal}
+                title="Repay Debt"
+                action="Repay"
+                amount={actionAmounts.repayAmount}
+                setAmount={(amount) => setActionAmounts(prev => ({ ...prev, repayAmount: amount }))}
+                onSubmit={() => repayDebt(actionAmounts.repayAmount)}
+                isLoading={actionLoading.repay}
+                maxAmount={Math.min(parseFloat(walletBalances.usdBalance), parseFloat(vaultData.updatedDebt)).toFixed(2)}
+                unit="MyUSD"
+                validateAmount={validateRepayAmount}
+            />
         </div>
     )
 }
