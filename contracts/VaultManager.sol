@@ -67,7 +67,21 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
     uint256 public mintFee = 5e15; // 0.5%
 
 
-
+    struct VaultDashboardData {
+        uint256 collateralETH;
+        uint256 debtMyUSD;
+        uint256 updatedDebt;
+        bool zeroLiquidation;
+        uint256 collateralRatio;
+        uint256 liquidationPrice;
+        uint256 safetyBuffer;
+        uint256 maxMintable;
+        uint256 accruedInterest;
+        uint8 liquidationRisk;
+        uint256 ethPrice;
+        uint256 annualInterestRate;
+        uint256 timeUntilRebalance;
+    }
 
 
 
@@ -399,6 +413,160 @@ contract VaultManager is ReentrancyGuard, Ownable, Pausable {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /**
+     * @notice Get liquidation price for a user's vault
+     * @param user The vault owner address
+     * @return liquidationPrice The ETH price at which the vault becomes liquidatable
+     */
+    function getLiquidationPrice(address user) public view returns (uint256 liquidationPrice) {
+        Vault memory vault = vaults[user];
+        if (vault.collateralETH == 0 || vault.debtMyUSD == 0) {
+            return 0;
+        }
+        
+        uint256 updatedDebt = getUpdatedDebt(user);
+        uint256 requiredRatio = vault.zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
+        
+        // liquidationPrice = (debt * requiredRatio) / (collateral * priceDecimals)
+        return (updatedDebt * requiredRatio * (10 ** priceDecimals)) / (vault.collateralETH * 1e18);
+    }
+
+    /**
+     * @notice Calculate safety buffer above liquidation price
+     * @param user The vault owner address
+     * @return safetyBuffer Percentage buffer above liquidation (in basis points)
+     */
+    function getSafetyBuffer(address user) public view returns (uint256 safetyBuffer) {
+        uint256 currentPrice = getLatestPrice();
+        uint256 liquidationPrice = getLiquidationPrice(user);
+        
+        if (liquidationPrice == 0 || currentPrice <= liquidationPrice) {
+            return 0;
+        }
+        
+        // Calculate percentage difference: ((currentPrice - liquidationPrice) / liquidationPrice) * 10000
+        return ((currentPrice - liquidationPrice) * 10000) / liquidationPrice;
+    }
+
+    /**
+     * @notice Get maximum MyUSD that can be minted given current collateral
+     * @param user The vault owner address
+     * @return maxMintable Maximum additional MyUSD that can be minted
+     */
+    function getMaxMintable(address user) public view returns (uint256 maxMintable) {
+        Vault memory vault = vaults[user];
+        if (vault.collateralETH == 0) {
+            return 0;
+        }
+        
+        uint256 ethPrice = getLatestPrice();
+        uint256 collateralValue = vault.collateralETH * ethPrice / (10 ** priceDecimals);
+        uint256 requiredRatio = vault.zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
+        uint256 updatedDebt = getUpdatedDebt(user);
+        
+        // maxDebt = collateralValue * 1e18 / requiredRatio
+        uint256 maxTotalDebt = (collateralValue * 1e18) / requiredRatio;
+        
+        if (maxTotalDebt <= updatedDebt) {
+            return 0;
+        }
+        
+        uint256 additionalDebtCapacity = maxTotalDebt - updatedDebt;
+        
+        // Account for mint fee: maxMintable = additionalDebtCapacity / (1 + mintFee)
+        return (additionalDebtCapacity * 1e18) / (1e18 + mintFee);
+    }
+
+    /**
+     * @notice Get accrued interest for a user's vault
+     * @param user The vault owner address
+     * @return accruedInterest Amount of interest accrued since last update
+     */
+    function getAccruedInterest(address user) public view returns (uint256 accruedInterest) {
+        Vault memory vault = vaults[user];
+        if (vault.debtMyUSD == 0) {
+            return 0;
+        }
+        
+        uint256 updatedDebt = getUpdatedDebt(user);
+        return updatedDebt > vault.debtMyUSD ? updatedDebt - vault.debtMyUSD : 0;
+    }
+
+    /**
+     * @notice Get time until next rebalance
+     * @return timeUntilRebalance Seconds until next rebalance
+     */
+    function getTimeUntilRebalance() public view returns (uint256 timeUntilRebalance) {
+        if (!rebalancingEnabled) {
+            return 0;
+        }
+        
+        uint256 timeSinceLastRebalance = block.timestamp - lastRebalance;
+        if (timeSinceLastRebalance >= REBALANCE_INTERVAL) {
+            return 0;
+        }
+        
+        return REBALANCE_INTERVAL - timeSinceLastRebalance;
+    }
+
+    /**
+     * @notice Get current annual interest rate as a percentage
+     * @return annualRatePercent Annual interest rate as percentage (e.g., 3.2 for 3.2%)
+     */
+    function getAnnualInterestRatePercent() public view returns (uint256 annualRatePercent) {
+        uint256 annualRate = getAnnualRate();
+        // Convert from fixed point to percentage: (rate - 1e18) * 100
+        if (annualRate <= 1e18) {
+            return 0;
+        }
+        return ((annualRate - 1e18) * 100) / 1e18;
+    }
+
+    /**
+     * @notice Determine liquidation risk level for a vault
+     * @param user The vault owner address
+     * @return riskLevel 0=Low, 1=Medium, 2=High, 3=Critical
+     */
+    function getLiquidationRisk(address user) public view returns (uint8 riskLevel) {
+        uint256 ratio = getCollateralRatio(user);
+        uint256 requiredRatio = vaults[user].zeroLiquidation ? ZERO_LIQUIDATION_COLLATERAL_RATIO : STANDARD_COLLATERAL_RATIO;
+        
+        if (ratio == type(uint256).max) {
+            return 0; // Low risk (no debt)
+        }
+        
+        if (ratio >= requiredRatio + 50e16) { // 50% above required
+            return 0; // Low
+        } else if (ratio >= requiredRatio + 20e16) { // 20% above required
+            return 1; // Medium  
+        } else if (ratio >= requiredRatio + 5e16) { // 5% above required
+            return 2; // High
+        } else {
+            return 3; // Critical
+        }
+    }
+
+
+
+
+    function getDashboardData(address user) external view returns (VaultDashboardData memory data) {
+        Vault memory vault = vaults[user];
+        
+        data.collateralETH = vault.collateralETH;
+        data.debtMyUSD = vault.debtMyUSD;
+        data.updatedDebt = getUpdatedDebt(user);
+        data.zeroLiquidation = vault.zeroLiquidation;
+        data.collateralRatio = getCollateralRatio(user);
+        data.liquidationPrice = getLiquidationPrice(user);
+        data.safetyBuffer = getSafetyBuffer(user);
+        data.maxMintable = getMaxMintable(user);
+        data.accruedInterest = getAccruedInterest(user);
+        data.liquidationRisk = getLiquidationRisk(user);
+        data.ethPrice = getLatestPrice();
+        data.annualInterestRate = getAnnualInterestRatePercent();
+        data.timeUntilRebalance = getTimeUntilRebalance();
     }
    
 
